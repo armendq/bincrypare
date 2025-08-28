@@ -1,0 +1,32 @@
+name: exec-bot
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run bot (dry-run)
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          DRY_RUN: "1"
+        run: python exec_bot.py
+      - name: Persist state
+        run: |
+          git config user.name "bincrypare-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/open_positions.json || true
+          git commit -m "state: update open positions" || true
+          git push || true
