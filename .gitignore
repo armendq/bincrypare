@@ -1,8 +1,11 @@
-# Python
+.venv/
 __pycache__/
 *.pyc
-.venv/
 .env
+logs/
+state/*.bak
+.state_tmp/
+
 
 # OS
 .DS_Store
