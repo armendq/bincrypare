@@ -4,13 +4,11 @@
 """
 Analyses pipeline – robust scanner for pre-breakouts and breakouts.
 
-Key features:
-- Uses data-api.binance.vision (works in restricted regions)
-- Never calls Binance without a symbol (avoids 451/403)
-- Multi-timeframe trend filters (4h + 1h), momentum confirm (15m/5m)
-- Pre-breakout detection: proximity to HH20 with rising ATR + volume thrust
-- Candidate ranking: volume z-score, proximity/ATR, RS vs BTC
-- Always emits a valid summary.json under public_runs/latest/summary.json
+Updates:
+- Universe built from Binance exchangeInfo (USDT spot only).
+- No Revolut mapping dependency.
+- Excludes stablecoins as base and leveraged tokens (UP/DOWN/BULL/BEAR/XL/XS).
+- rotation_exempt is always False (execution layer decides).
 """
 
 from __future__ import annotations
@@ -18,9 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import statistics
-import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -65,64 +61,14 @@ BREAK_BUFFER_ATR = 0.10  # entry buffer above HH20 for B signals
 # Ranking
 MAX_CANDIDATES = 10
 
-# Revolut universe (trimmed to non-stables later)
-REVOLUT_TICKERS: Dict[str, str] = {
-    "1INCH": "1INCH", "AAVE": "Aave", "ACA": "Acala Token", "ADA": "Cardano", "AERGO": "Aergo",
-    "AGLD": "Adventure Gold", "AIOZ": "AIOZ Network", "AKT": "Akash Network", "ALGO": "Algorand",
-    "ALICE": "MyNeighborAlice", "ALPHA": "Alpha Venture DAO", "AMP": "AMP", "ANKR": "Ankr",
-    "APE": "ApeCoin", "API3": "API3", "APT": "Aptos", "AR": "Arweave", "ARB": "Arbitrum",
-    "ARKM": "Arkham", "ARPA": "ARPA", "ASTR": "Astar", "ATOM": "Cosmos", "AUDIO": "Audius",
-    "AVAX": "Avalanche", "AXS": "Axie Infinity", "BAL": "Balancer", "BAND": "Band Protocol",
-    "BAT": "Basic Attention Token", "BCH": "Bitcoin Cash", "BICO": "Biconomy", "BLUR": "Blur",
-    "BLZ": "Bluzelle", "BNC": "Bifrost", "BNT": "Bancor", "BONK": "Bonk", "BOND": "BarnBridge",
-    "BTC": "Bitcoin", "BTG": "Bitcoin Gold", "BTRST": "Braintrust", "BTT": "BitTorrent",
-    "CELO": "Celo", "CELR": "Celer Network", "CFX": "Conflux", "CHZ": "Chiliz", "CHR": "Chromia",
-    "CLV": "Clover Finance", "COMP": "Compound", "COTI": "COTI", "CQT": "Covalent",
-    "CRO": "Cronos", "CRV": "Curve DAO Token", "CTSI": "Cartesi", "CVC": "Civic",
-    "CVX": "Convex Finance", "DAI": "Dai", "DAR": "Mines of Dalarnia", "DASH": "Dash",
-    "DENT": "Dent", "DGB": "DigiByte", "DIMO": "DIMO", "DNT": "district0x", "DOGE": "Dogecoin",
-    "DOT": "Polkadot", "DREP": "DREP", "DYDX": "dYdX", "EGLD": "MultiversX", "ENA": "Ethena",
-    "ENJ": "Enjin Coin", "ENS": "Ethereum Name Service", "EOS": "EOS", "ETC": "Ethereum Classic",
-    "ETH": "Ethereum", "ETHW": "EthereumPoW", "EUL": "Euler", "FET": "Fetch.ai", "FIDA": "Bonfida",
-    "FIL": "Filecoin", "FLOKI": "FLOKI", "FLOW": "Flow", "FLR": "Flare", "FORTH": "Ampleforth Governance Token",
-    "FTM": "Fantom", "FXS": "Frax Share", "GALA": "Gala", "GFI": "Goldfinch", "GHST": "Aavegotchi",
-    "GLM": "Golem", "GLMR": "Moonbeam", "GMT": "STEPN", "GMX": "GMX", "GNO": "Gnosis",
-    "GNS": "Gains Network", "GODS": "Gods Unchained", "GRT": "The Graph", "HBAR": "Hedera",
-    "HFT": "Hashflow", "HIGH": "Highstreet", "HOPR": "HOPR", "HOT": "Holo", "ICP": "Internet Computer",
-    "IDEX": "IDEX", "ILV": "Illuvium", "IMX": "Immutable", "INJ": "Injective", "IOTX": "IoTeX",
-    "JASMY": "JasmyCoin", "JTO": "Jito", "JUP": "Jupiter", "KAVA": "Kava", "KDA": "Kadena",
-    "KNC": "Kyber Network", "KSM": "Kusama", "LDO": "Lido DAO", "LINK": "Chainlink",
-    "LPT": "Livepeer", "LQTY": "Liquity", "LRC": "Loopring", "LSK": "Lisk", "LTC": "Litecoin",
-    "MAGIC": "MAGIC", "MANA": "Decentraland", "MASK": "Mask Network", "MATIC": "Polygon",
-    "MC": "Merit Circle", "MDT": "Measurable Data Token", "MINA": "Mina", "MKR": "Maker",
-    "MLN": "Enzyme", "MPL": "Maple", "MTRG": "Meter Governance", "NEAR": "NEAR Protocol",
-    "NEXO": "Nexo", "NKN": "NKN", "OCEAN": "Ocean Protocol", "OGN": "Origin Protocol",
-    "OMG": "OMG Network", "ONDO": "Ondo", "ONG": "Ontology Gas", "ONT": "Ontology",
-    "OP": "Optimism", "ORCA": "Orca", "OXT": "Orchid", "PAXG": "PAX Gold", "PENDLE": "Pendle",
-    "PEPE": "PEPE", "PERP": "Perpetual Protocol", "PIXEL": "Pixels", "PLA": "PlayDapp",
-    "POKT": "Pocket Network", "POLS": "Polkastarter", "POLYX": "Polymesh", "POND": "Marlin",
-    "POWR": "Powerledger", "PUNDIX": "Pundi X", "QI": "BENQI", "QNT": "Quant", "QTUM": "Qtum",
-    "RAD": "Radicle", "RARE": "SuperRare", "RARI": "Rarible", "RAY": "Raydium", "REN": "Ren",
-    "REQ": "Request", "RLC": "iExec RLC", "RLY": "Rally", "RNDR": "Render", "RON": "Ronin",
-    "ROSE": "Oasis Network", "RPL": "Rocket Pool", "RSR": "Reserve Rights", "SAND": "The Sandbox",
-    "SC": "Siacoin", "SGB": "Songbird", "SHIB": "Shiba Inu", "SKL": "SKALE Network",
-    "SLP": "Smooth Love Potion", "SNT": "Status", "SNX": "Synthetix", "SOL": "Solana",
-    "SPELL": "Spell Token", "STG": "Stargate Finance", "STORJ": "Storj", "STRK": "Starknet",
-    "STX": "Stacks", "SUI": "Sui", "SUSHI": "SushiSwap", "SYN": "Synapse", "SYNTH": "SYNTH",
-    "T": "Threshold", "TEL": "Telcoin", "TIA": "Celestia", "TON": "Toncoin", "TRB": "Tellor",
-    "TRU": "TrueFi", "TRX": "TRON", "UMA": "UMA", "UNI": "Uniswap", "USDC": "USD Coin",
-    "USDT": "Tether", "VET": "VeChain", "VOXEL": "Voxies", "VTHO": "VeThor Token", "WAVES": "Waves",
-    "WAXP": "WAX", "WBTC": "Wrapped Bitcoin", "WCFG": "Wrapped Centrifuge", "WLD": "Worldcoin",
-    "WOO": "WOO Network", "XLM": "Stellar", "XMR": "Monero", "XRP": "XRP", "XTZ": "Tezos",
-    "XVS": "Venus", "YFI": "yearn.finance", "YGG": "Yield Guild Games", "ZEC": "Zcash",
-    "ZETA": "ZetaChain", "ZIL": "Zilliqa", "ZRX": "0x"
-}
-
-# Exclude stablecoins from scanning
+# Exclude bases that are stablecoins or synthetic dollars
 STABLES = {"USDT", "USDC", "DAI", "TUSD", "USDP", "BUSD", "FDUSD", "PYUSD"}
 
-# Rotation-exempt info (respected downstream; we annotate for clarity)
-ROTATION_EXEMPT = {"ETH", "DOT"}
+# Exclude leveraged/multiplier tokens by base suffix
+LEVERAGED_SUFFIXES = (
+    "UP", "DOWN", "BULL", "BEAR",
+    "2L", "2S", "3L", "3S", "4L", "4S", "5L", "5S"
+)
 
 # -------------------------- HELPERS -----------------------------------
 
@@ -138,13 +84,11 @@ def ensure_dirs(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 def safe_get(url: str, params: Optional[dict] = None, retries: int = 3, timeout: int = 20, sleep_s: float = 0.6) -> Optional[requests.Response]:
-    """GET with retries/backoff. Returns Response or None."""
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return r
-            # transient/rate-limit statuses
             if r.status_code in (418, 429, 451, 403, 504, 500):
                 time.sleep(sleep_s * attempt)
             else:
@@ -220,12 +164,16 @@ def fetch_exchange_usdt_symbols() -> Dict[str, dict]:
     data = r.json()
     out: Dict[str, dict] = {}
     for s in data.get("symbols", []):
-        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("isSpotTradingAllowed", True):
-            out[s["symbol"]] = s
+        if s.get("status") != "TRADING":
+            continue
+        if s.get("quoteAsset") != "USDT":
+            continue
+        if not s.get("isSpotTradingAllowed", True):
+            continue
+        out[s["symbol"]] = s
     return out
 
 def fetch_klines(symbol: str, interval: str, limit: int) -> Optional[List[List[Any]]]:
-    """Fetch raw klines array for a given symbol/interval."""
     url = f"{BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = safe_get(url, params=params, retries=3, timeout=20)
@@ -240,7 +188,6 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> Optional[List[List[A
     return None
 
 def parse_klines(raw: List[List[Any]]) -> Dict[str, List[float]]:
-    """Return dict with open_time(ms), open, high, low, close, volume as lists (floats)."""
     ot: List[int] = []
     o: List[float] = []
     h: List[float] = []
@@ -248,7 +195,6 @@ def parse_klines(raw: List[List[Any]]) -> Dict[str, List[float]]:
     c: List[float] = []
     v: List[float] = []
     for row in raw:
-        # [ openTime, open, high, low, close, volume, closeTime, ... ]
         ot.append(int(row[0]))
         o.append(float(row[1]))
         h.append(float(row[2]))
@@ -260,8 +206,6 @@ def parse_klines(raw: List[List[Any]]) -> Dict[str, List[float]]:
 # -------------------------- CORE LOGIC --------------------------------
 
 def analyze_symbol(symbol: str, btc_1h_close: List[float]) -> Optional[dict]:
-    """Analyze single symbol; return candidate dict or confirmed breakout dict with 'signal' key."""
-    # Fetch required timeframes
     req: Dict[str, Dict[str, List[float]]] = {}
     for tf, (interval, limit) in INTERVALS.items():
         raw = fetch_klines(symbol, interval, limit)
@@ -325,7 +269,7 @@ def analyze_symbol(symbol: str, btc_1h_close: List[float]) -> Optional[dict]:
     mom5 = mom_ok(five)
     lower_tf_ok = mom15 and mom5
 
-    # RS vs BTC (1h)
+    # RS vs BTC (1h) – only if lengths match
     rs_strength = 0.0
     if btc_1h_close and len(btc_1h_close) == len(close_1h):
         rs_series = [c / b if b != 0 else 0.0 for c, b in zip(close_1h, btc_1h_close)]
@@ -410,21 +354,28 @@ def write_summary(payload: dict, dest_latest: Path) -> None:
 # -------------------------- MAIN --------------------------------------
 
 def build_universe() -> Tuple[Dict[str, str], List[str]]:
+    """
+    Build mapping {base: symbol} for all Binance USDT spot pairs, excluding:
+      - base in STABLES
+      - leveraged tokens with suffixes in LEVERAGED_SUFFIXES
+    Returns (mapping, missing_binance) where missing_binance is kept for contract compatibility (empty here).
+    """
     exch = fetch_exchange_usdt_symbols()
-    mapping: Dict[str, str] = {}
-    missing_binance: List[str] = []
     if not exch:
-        return mapping, list(REVOLUT_TICKERS.keys())
+        return {}, []
 
-    binance_symbols_available = set(exch.keys())
-    tickers = [t for t in REVOLUT_TICKERS.keys() if t not in STABLES]
-    for t in tickers:
-        sym = f"{t}USDT"
-        if sym in binance_symbols_available:
-            mapping[t] = sym
-        else:
-            missing_binance.append(t)
-    return mapping, missing_binance
+    mapping: Dict[str, str] = {}
+    for sym, meta in exch.items():
+        base = meta.get("baseAsset", "").upper()
+        if not base:
+            continue
+        if base in STABLES:
+            continue
+        if any(base.endswith(sfx) for sfx in LEVERAGED_SUFFIXES):
+            continue
+        mapping[base] = sym
+
+    return mapping, []  # no "missing_binance" concept when sourcing from Binance directly
 
 def compute_regime(btc_1h: Dict[str, List[float]], btc_4h: Dict[str, List[float]]) -> Tuple[bool, str]:
     try:
@@ -445,7 +396,7 @@ def compute_regime(btc_1h: Dict[str, List[float]], btc_4h: Dict[str, List[float]
 def run_pipeline(mode: str) -> dict:
     started = datetime.now(timezone.utc).astimezone(TZ)
 
-    mapping, missing_binance = build_universe()
+    mapping, _missing_binance = build_universe()
     if not mapping:
         payload = {
             "generated_at": human_time(started),
@@ -454,7 +405,7 @@ def run_pipeline(mode: str) -> dict:
             "signals": {"type": "HOLD"},
             "orders": [],
             "candidates": [],
-            "universe": {"scanned": 0, "eligible": 0, "skipped": {"no_data": [], "missing_binance": sorted(missing_binance)}},
+            "universe": {"scanned": 0, "eligible": 0, "skipped": {"no_data": [], "missing_binance": []}},
             "meta": {"binance_endpoint": BASE_URL, "mode": mode},
         }
         return payload
@@ -472,7 +423,7 @@ def run_pipeline(mode: str) -> dict:
             "signals": {"type": "HOLD"},
             "orders": [],
             "candidates": [],
-            "universe": {"scanned": 0, "eligible": len(mapping), "skipped": {"no_data": [], "missing_binance": sorted(missing_binance)}},
+            "universe": {"scanned": 0, "eligible": len(mapping), "skipped": {"no_data": [], "missing_binance": []}},
             "meta": {"binance_endpoint": BASE_URL, "mode": mode},
         }
         return payload
@@ -487,21 +438,19 @@ def run_pipeline(mode: str) -> dict:
     no_data: List[str] = []
     scanned = 0
 
-    # Optionally thin the mapping in light-fast mode for speed (scan subset)
-    items = list(mapping.items())
+    items = list(mapping.items())  # [(base, symbol), ...]
     if mode == "light-fast":
-        # simple downsample: every 2nd symbol
-        items = items[::2]
+        items = items[::2]  # simple downsample for speed
 
-    for t, sym in items:
+    for base, sym in items:
         scanned += 1
         info = analyze_symbol(sym, btc_close_1h)
         time.sleep(0.03)  # light pacing
         if not info:
-            no_data.append(t)
+            no_data.append(base)
             continue
-        info["ticker"] = t
-        info["rotation_exempt"] = (t in ROTATION_EXEMPT)
+        info["ticker"] = base
+        info["rotation_exempt"] = False  # executor decides; no special-casing here
         if info["signal"] == "B":
             confirmed.append(info)
         elif info["signal"] == "C":
@@ -525,7 +474,7 @@ def run_pipeline(mode: str) -> dict:
                 "atr": round(o["atr"], 8),
                 "tf": "1h",
                 "notes": o.get("reasons", []),
-                "rotation_exempt": o["rotation_exempt"],
+                "rotation_exempt": False,
             })
     elif top_candidates:
         signal_type = "C"
@@ -545,7 +494,7 @@ def run_pipeline(mode: str) -> dict:
         "rs10": round(c["rs10"], 4),
         "tf": "1h",
         "notes": c.get("reasons", []),
-        "rotation_exempt": c["rotation_exempt"],
+        "rotation_exempt": False,
     } for c in top_candidates]
 
     payload: Dict[str, Any] = {
@@ -560,7 +509,7 @@ def run_pipeline(mode: str) -> dict:
             "eligible": len(mapping),
             "skipped": {
                 "no_data": sorted(no_data),
-                "missing_binance": sorted(missing_binance),
+                "missing_binance": [],  # kept for compatibility
             },
         },
         "meta": {
@@ -603,6 +552,7 @@ def main() -> None:
         }
 
     latest_path = Path("public_runs/latest/summary.json")
+    ensure_dirs(latest_path)
     write_summary(payload, latest_path)
 
     stamp = datetime.now(timezone.utc).astimezone(TZ).strftime("%Y%m%d_%H%M%S")
