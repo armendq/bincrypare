@@ -21,7 +21,7 @@ jobs:
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "1"
+          DRY_RUN: "0"
         run: python exec_bot.py
       - name: Persist state
         run: |
