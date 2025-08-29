@@ -10,6 +10,7 @@ SUMMARY_URL = "https://raw.githubusercontent.com/armendq/bincrypare/main/public_
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDC")
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 FORCE_EQUITY = float(os.getenv("FORCE_EQUITY_USD", "0"))
+TRADE_CANDS = os.getenv("TRADE_CANDIDATES", "0") == "1"
 
 API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -54,7 +55,6 @@ def near(a: float, b: float, tol: float) -> bool:
     return abs(a - b) <= tol * max(1e-12, b)
 
 def get_spot_balance(asset: str) -> tuple[float, float, float]:
-    """free, locked, total for Spot wallet."""
     try:
         acct = client.get_account()
     except Exception as e:
@@ -74,14 +74,14 @@ def equity_for_sizing() -> float:
     free, _, _ = get_spot_balance(QUOTE_ASSET)
     return free
 
-def place_order(sym: str, entry: float, stop: float, t1: float, t2: float) -> float:
+def size_and_maybe_buy(sym: str, entry: float, stop: float, t1: float, t2: float, tag: str) -> float:
     eq = equity_for_sizing()
-    log(f"Equity used for sizing ({QUOTE_ASSET}): {eq:.2f}")
-    risk = eq * RISK_PCT
+    log(f"[{tag}] Equity used for sizing ({QUOTE_ASSET}): {eq:.2f}")
     rpu = max(entry - stop, entry * 0.002)
     if rpu <= 0:
-        log(f"[SKIP] {sym} invalid risk_per_unit")
+        log(f"[{tag}] {sym} invalid risk_per_unit")
         return 0.0
+    risk = eq * RISK_PCT
     raw_qty = max(risk / rpu, MIN_NOTIONAL / max(entry, 1e-12))
     raw_qty = math.floor(raw_qty * 1_000_000) / 1_000_000
     notional = raw_qty * entry
@@ -91,19 +91,19 @@ def place_order(sym: str, entry: float, stop: float, t1: float, t2: float) -> fl
         notional = raw_qty * entry
 
     if DRY_RUN:
-        log(f"[DRY ENTRY] {sym} qty={raw_qty:.6f} notional≈{notional:.2f} entry={entry:.8f} stop={stop:.8f} t1={t1:.8f} t2={t2:.8f}")
+        log(f"[{tag} DRY] {sym} qty={raw_qty:.6f} notional≈{notional:.2f} entry={entry:.8f} stop={stop:.8f} t1={t1:.8f} t2={t2:.8f}")
         return raw_qty
 
     try:
         order = client.order_market_buy(symbol=sym, quantity=raw_qty)
-        log(f"[LIVE ENTRY] {sym} market buy qty={raw_qty:.6f} notional≈{notional:.2f}")
+        log(f"[{tag} LIVE] {sym} market buy qty={raw_qty:.6f} notional≈{notional:.2f}")
         return raw_qty
     except Exception as e:
-        log(f"[ENTRY ERROR] {sym}: {e}")
+        log(f"[{tag} ENTRY ERROR] {sym}: {e}")
         return 0.0
 
 def main():
-    # ALWAYS print balances first
+    # print balances at start
     free, locked, total = get_spot_balance(QUOTE_ASSET)
     if FORCE_EQUITY > 0:
         log(f"Balance check: OVERRIDE {FORCE_EQUITY:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
@@ -113,33 +113,33 @@ def main():
     S = fetch_summary()
     state = load_state()
     state["_last_run"] = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    state["_last_balance"] = {
-        "asset": QUOTE_ASSET,
-        "free": round(free, 8),
-        "locked": round(locked, 8),
-        "total": round(total, 8),
-        "override": FORCE_EQUITY if FORCE_EQUITY > 0 else None,
-    }
+    state["_last_balance"] = {"asset": QUOTE_ASSET, "free": round(free, 8), "locked": round(locked, 8), "total": round(total, 8)}
 
     if not S:
-        save_state(state)
-        return
+        save_state(state); return
 
-    if S.get("signals", {}).get("type") != "B":
-        log("Hold and wait.")
-        save_state(state)
-        return
+    sig = S.get("signals", {}).get("type")
+
+    # Always log candidate sizing to see potential trades
+    if S.get("candidates"):
+        for c in S["candidates"]:
+            sym = c["symbol"]
+            if not sym.endswith(QUOTE_ASSET): continue
+            size_and_maybe_buy(sym, float(c["entry"]), float(c["stop"]), float(c["t1"]), float(c["t2"]), tag="CAND") if TRADE_CANDS else log(f"[CAND] {sym} entry={c['entry']} stop={c['stop']} t1={c['t1']} t2={c['t2']}")
+
+    if sig != "B":
+        log("Hold and wait. (No B signal)")
+        save_state(state); return
 
     orders = S.get("orders", []) or []
     if not orders:
         log("No orders in B signal.")
-        save_state(state)
-        return
+        save_state(state); return
 
     for o in orders:
         sym = o["symbol"]
-        if not sym.endswith(QUOTE_ASSET):
-            continue
+        if not sym.endswith(QUOTE_ASSET): continue
+
         entry = float(o["entry"]); stop = float(o["stop"])
         t1 = float(o["t1"]); t2 = float(o["t2"])
 
@@ -150,9 +150,8 @@ def main():
                 log(f"[SKIP] {sym} duplicate near entry.")
                 continue
 
-        qty = place_order(sym, entry, stop, t1, t2)
-        if qty <= 0:
-            continue
+        qty = size_and_maybe_buy(sym, entry, stop, t1, t2, tag="BREAKOUT")
+        if qty <= 0: continue
 
         state[sym] = {
             "entry": entry, "stop": stop, "t1": t1, "t2": t2,
