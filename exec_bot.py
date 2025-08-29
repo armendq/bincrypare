@@ -10,15 +10,15 @@ from binance.enums import (
     ORDER_TYPE_MARKET, ORDER_TYPE_STOP_LOSS_LIMIT, ORDER_TYPE_LIMIT
 )
 
-# -------- Config (env) --------
+# env
 SUMMARY_URL       = os.getenv("SUMMARY_URL", "https://raw.githubusercontent.com/armendq/bincrypare/main/public_runs/latest/summary.json")
 QUOTE_ASSET       = os.getenv("QUOTE_ASSET", "USDC")
 DRY_RUN           = os.getenv("DRY_RUN", "1") == "1"
 FORCE_EQUITY      = float(os.getenv("FORCE_EQUITY_USD", "0"))
-TRADE_CANDS       = os.getenv("TRADE_CANDIDATES", "1") == "1"   # enable candidate trading
-C_RISK_MULT       = float(os.getenv("C_RISK_MULT", "0.5"))      # risk fraction for candidates
-RISK_PCT          = float(os.getenv("RISK_PCT", "0.012"))       # 1.2% default
-STOP_LIMIT_OFFSET = float(os.getenv("STOP_LIMIT_OFFSET", "0.001"))  # +0.1% above entry for limit leg
+TRADE_CANDS       = os.getenv("TRADE_CANDIDATES", "1") == "1"
+C_RISK_MULT       = float(os.getenv("C_RISK_MULT", "0.5"))
+RISK_PCT          = float(os.getenv("RISK_PCT", "0.012"))
+STOP_LIMIT_OFFSET = float(os.getenv("STOP_LIMIT_OFFSET", "0.001"))
 MIN_NOTIONAL_FALLBACK = float(os.getenv("MIN_NOTIONAL", "5.0"))
 
 API_KEY   = os.getenv("BINANCE_API_KEY", "")
@@ -29,7 +29,6 @@ STATE_FILE = STATE_DIR / "open_positions.json"
 
 client = Client(API_KEY, API_SECRET)
 
-# -------- Utils --------
 def now_str() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -48,6 +47,14 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 def fetch_summary() -> dict | None:
+    if SUMMARY_URL.startswith("file://"):
+        try:
+            p = SUMMARY_URL.replace("file://", "", 1)
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"[LOCAL READ ERROR] {e}")
+            return None
     for attempt in (1, 2):
         try:
             r = requests.get(SUMMARY_URL, timeout=20)
@@ -80,7 +87,6 @@ def equity_for_sizing() -> float:
     return free
 
 def get_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
-    """minQty, stepQty, tickSize, minNotional"""
     info = client.get_symbol_info(symbol)
     lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
     pricef = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
@@ -98,14 +104,13 @@ def round_to_tick(p: float, tick: float) -> float:
 
 def compute_qty(entry: float, stop: float, equity: float, min_qty: float, step_qty: float, min_notional: float) -> float:
     risk_dollars = equity * RISK_PCT
-    rpu = max(entry - stop, entry * 0.002)  # floor for tight stops
+    rpu = max(entry - stop, entry * 0.002)
     if rpu <= 0: return 0.0
     raw_qty = max(risk_dollars / rpu, min_notional / max(entry, 1e-12))
     qty = floor_to_step(raw_qty, step_qty)
     if qty < min_qty: return 0.0
     return qty
 
-# -------- Order helpers --------
 def place_market_buy(symbol: str, qty: float) -> dict | None:
     if DRY_RUN:
         log(f"[MARKET BUY dry] {symbol} qty={qty:.8f}")
@@ -153,9 +158,7 @@ def place_tp_limits(symbol: str, qty: float, t1: float, t2: float, tick: float) 
     except Exception as e:
         log(f"[TP ERROR] {symbol}: {e}")
 
-# -------- Main --------
 def main():
-    # balance first
     free, locked, total = get_spot_balance(QUOTE_ASSET)
     if FORCE_EQUITY > 0:
         log(f"Balance: OVERRIDE {FORCE_EQUITY:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
@@ -191,7 +194,7 @@ def main():
                     "entry": entry, "stop": stop, "t1": t1, "t2": t2,
                     "filled_qty": 0.0, "t1_filled_qty": 0.0,
                     "status": "pending", "entry_order_id": o.get("orderId"),
-                    "type": "CAND"
+                    "type": "C"
                 }
 
     # Breakouts -> market buy now + place TPs
