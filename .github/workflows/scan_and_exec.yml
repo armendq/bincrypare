@@ -2,7 +2,7 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/17 * * * *"     # every 17 minutes to avoid overlap
+    - cron: "*/7 * * * *"   # every 7 minutes, avoids overlap
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   run:
-    runs-on: [self-hosted]    # your Hetzner runner
+    runs-on: [self-hosted]          # your Hetzner runner
     timeout-minutes: 30
 
     steps:
@@ -49,8 +49,9 @@ jobs:
           set -euo pipefail
           python -m scripts.analyses --mode deep
           test -s public_runs/latest/summary.json
-          python -c "import json; p=json.load(open('public_runs/latest/summary.json')); print('signals:', p.get('signals'),'regime:',p.get('regime'))"
+          python -c "import json; p=json.load(open('public_runs/latest/summary.json')); print('signals:', p.get('signals'), 'regime:', p.get('regime'))"
 
+      # ---------- COMMIT SCAN ARTIFACTS ----------
       - name: Commit public_runs
         run: |
           set -euo pipefail
@@ -58,13 +59,24 @@ jobs:
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
 
-          # stage & commit first
+          # Stage new scan output and commit locally
           git add public_runs
-          git diff --cached --quiet || git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if git diff --cached --quiet; then
+            echo "No public_runs changes."
+          else
+            git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          fi
 
-          # sync with remote safely
+          # Merge remote, always prefer our newly-generated files on conflicts
           git fetch origin main
-          git pull --rebase --autostash origin main || true
+          git merge -X ours --no-edit origin/main || true
+
+          # Ensure no leftover merge state
+          if [ -e .git/MERGE_HEAD ]; then
+            git add -A
+            git commit -m "merge(resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
+          fi
+
           git push origin HEAD:main || true
 
       # ---------- EXECUTOR ----------
@@ -83,6 +95,7 @@ jobs:
           set -euo pipefail
           python exec_bot.py
 
+      # ---------- COMMIT STATE ONLY ----------
       - name: Persist state
         run: |
           set -euo pipefail
@@ -90,11 +103,23 @@ jobs:
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
 
+          # Only touch state file to avoid re-conflicting with public_runs
           if [ -f state/open_positions.json ]; then
             git add state/open_positions.json
-            git diff --cached --quiet || git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            if git diff --cached --quiet; then
+              echo "No state changes."
+            else
+              git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            fi
+
+            # Merge remote, keep our state on conflicts
             git fetch origin main
-            git pull --rebase --autostash origin main || true
+            git merge -X ours --no-edit origin/main || true
+            if [ -e .git/MERGE_HEAD ]; then
+              git add state/open_positions.json || true
+              git commit -m "merge(state resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
+            fi
+
             git push origin HEAD:main || true
           else
             echo "No state file to persist."
