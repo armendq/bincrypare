@@ -2,23 +2,24 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"     # every 10 min to avoid overlap
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# let a run finish; never cancel it because a new one queued
 concurrency:
-  group: scan-and-exec
-  cancel-in-progress: true
+  group: scan-and-exec-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
   run:
-    runs-on: [self-hosted]
-    timeout-minutes: 20
+    runs-on: [self-hosted]     # your Hetzner runner
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -36,7 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-binance jq
 
-      # ANALYSES
+      # ------- ANALYSES -------
       - name: Ensure output dirs
         run: mkdir -p public_runs/latest
 
@@ -61,7 +62,7 @@ jobs:
           git diff --cached --quiet || git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push origin HEAD:main || true
 
-      # EXECUTOR
+      # ------- EXECUTOR -------
       - name: Run exec bot on fresh local summary
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
