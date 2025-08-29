@@ -2,13 +2,13 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/7 * * * *"    # every 7 minutes (reduces overlap)
+    - cron: "*/5 * * * *"    # every 7 minutes (reduces overlap)
   workflow_dispatch:
     inputs:
       ignore_regime:
         description: "Set 1 to bypass BTC regime"
         required: false
-        default: "0"
+        default: "1"
 
 permissions:
   contents: write
