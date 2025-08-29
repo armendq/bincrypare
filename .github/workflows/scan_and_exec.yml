@@ -2,13 +2,8 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/7 * * * *"   # every 7 minutes, avoids overlap
+    - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      ignore_regime:
-        description: "Set 1 to bypass BTC regime"
-        required: false
-        default: "1"
 
 permissions:
   contents: write
@@ -19,24 +14,10 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: "1"
-  BINANCE_BASE_URL: https://data-api.binance.vision
-  # Relaxed thresholds for more signals
-  RELAX_B_HIGH: "0"          # confirm with close, not high
-  BREAK_BUFFER_ATR: "0.03"
-  VOL_Z_MIN_BREAK: "1.2"
-  VOL_Z_MIN_PRE: "1.0"
-  PROX_ATR_MIN: "0.02"
-  PROX_ATR_MAX: "0.50"
-  MIN_AVG_VOL: "4000"
-  STOP_ATR_BUFFER: "0.4"
-  MIN_RISK_FLOOR_PCT: "0.01"
-  MAX_RISK_CAP_PCT: "0.04"
-  MAX_WORKERS: "6"
-  LOG_LEVEL: "INFO"
 
 jobs:
   run:
-    runs-on: [self-hosted]          # your Hetzner runner
+    runs-on: [self-hosted]
     timeout-minutes: 30
 
     steps:
@@ -53,31 +34,57 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-binance numpy
+          pip install requests python-binance
 
-      # ---------- ANALYSES ----------
       - name: Ensure output dirs
         run: mkdir -p public_runs/latest state
 
+      # 1) ANALYSES
       - name: Run analyses (deep, USDC)
+        env:
+          VOL_Z_MIN_BREAK: "1.3"
+          BREAK_BUFFER_ATR: "0.04"
+          RELAX_B_HIGH: "1"
         run: |
           set -euo pipefail
-          IGN="${{ github.event.inputs.ignore_regime || '0' }}"
-          if [[ "$IGN" == "1" ]]; then
-            python -m scripts.analyses --mode deep --ignore_regime
-          else
-            python -m scripts.analyses --mode deep
-          fi
+          python -m scripts.analyses --mode deep
           test -s public_runs/latest/summary.json
-          python -c "import json; p=json.load(open('public_runs/latest/summary.json')); print('signals:', p.get('signals'), 'regime:', p.get('regime'))"
+          python - <<'PY'
+          import json,sys
+          p=json.load(open('public_runs/latest/summary.json'))
+          print("signals:",p.get("signals"),"regime:",p.get("regime"))
+          PY
 
-      # ---------- COMMIT SCAN ARTIFACTS ----------
+      # 2) EXECUTE BOT ON THE FRESH LOCAL SUMMARY (before any git operations)
+      - name: Run exec bot on fresh local summary
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          DRY_RUN: "0"
+          FORCE_EQUITY_USD: "0"
+          QUOTE_ASSET: "USDC"
+          TRADE_CANDIDATES: "1"
+          C_RISK_MULT: "0.5"
+          STOP_LIMIT_OFFSET: "0.001"
+          SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
+        run: |
+          set -euo pipefail
+          # Hard-guard: fail early if JSON has conflict markers
+          if grep -qE '^(<<<<<<<|=======|>>>>>>>)' public_runs/latest/summary.json; then
+            echo "ERROR: summary.json has merge markers. Aborting exec."
+            sed -n '1,120p' public_runs/latest/summary.json || true
+            exit 1
+          fi
+          python exec_bot.py
+
+      # 3) COMMIT scan artifacts
       - name: Commit public_runs
         run: |
           set -euo pipefail
           git config --global safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
+          git config --global pull.rebase false
 
           git add public_runs
           if git diff --cached --quiet; then
@@ -86,41 +93,47 @@ jobs:
             git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           fi
 
-          git pull --rebase origin main || true
+          git fetch origin main || true
+          # Force our newly generated summary on conflicts
+          git merge -X ours --no-edit origin/main || true
+          if [ -e .git/MERGE_HEAD ]; then
+            git checkout --ours public_runs/latest/summary.json || true
+            git add public_runs/latest/summary.json || true
+            git commit -m "merge(resolved with -X ours for summary): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
+          fi
+
           git push origin HEAD:main || true
 
-      # ---------- EXECUTOR ----------
-      - name: Run exec bot on fresh local summary
-        env:
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "0"                 # 1=dry, 0=live
-          FORCE_EQUITY_USD: "0"        # use live USDC
-          QUOTE_ASSET: "USDC"
-          TRADE_CANDIDATES: "1"        # trade C via stop-limit
-          C_RISK_MULT: "0.5"           # candidates at half risk
-          STOP_LIMIT_OFFSET: "0.001"   # +0.1% above entry
-          SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
-        run: |
-          set -euo pipefail
-          python exec_bot.py
-
-      # ---------- COMMIT STATE ONLY ----------
+      # 4) COMMIT state only
       - name: Persist state
         run: |
           set -euo pipefail
           git config --global safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
+          git config --global pull.rebase false
 
           if [ -f state/open_positions.json ]; then
+            if grep -qE '^(<<<<<<<|=======|>>>>>>>)' state/open_positions.json; then
+              echo "Conflict markers found in state/open_positions.json; using ours."
+              git checkout --ours state/open_positions.json || true
+            fi
+
             git add state/open_positions.json
             if git diff --cached --quiet; then
               echo "No state changes."
             else
               git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             fi
-            git pull --rebase origin main || true
+
+            git fetch origin main || true
+            git merge -X ours --no-edit origin/main || true
+            if [ -e .git/MERGE_HEAD ]; then
+              git checkout --ours state/open_positions.json || true
+              git add state/open_positions.json || true
+              git commit -m "merge(state resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
+            fi
+
             git push origin HEAD:main || true
           else
             echo "No state file to persist."
