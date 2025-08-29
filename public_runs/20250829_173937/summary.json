@@ -1,0 +1,81 @@
+{
+  "generated_at": "2025-08-29 17:37:23 CEST",
+  "timezone": "Europe/Prague",
+  "regime": {
+    "ok": false,
+    "reason": "BTC not in uptrend"
+  },
+  "signals": {
+    "type": "HOLD"
+  },
+  "orders": [],
+  "candidates": [],
+  "universe": {
+    "scanned": 224,
+    "eligible": 224,
+    "skipped": {
+      "no_data": [
+        "1MBABYDOGE",
+        "A2Z",
+        "ACH",
+        "ACX",
+        "ANIME",
+        "AUCTION",
+        "BROCCOLI714",
+        "CHESS",
+        "COMP",
+        "COW",
+        "CVC",
+        "CYBER",
+        "DF",
+        "DOGS",
+        "DOLO",
+        "ENJ",
+        "ERA",
+        "GMT",
+        "GMX",
+        "GPS",
+        "GUN",
+        "HIVE",
+        "IDEX",
+        "ILV",
+        "KAIA",
+        "MAGIC",
+        "MASK",
+        "MITO",
+        "MOVE",
+        "MUBARAK",
+        "NIL",
+        "OSMO",
+        "PUNDIX",
+        "RESOLV",
+        "ROSE",
+        "RVN",
+        "SKL",
+        "SLF",
+        "SSV",
+        "STEEM",
+        "T",
+        "TLM",
+        "TNSR",
+        "TUT",
+        "UMA",
+        "UTK",
+        "VANA",
+        "XAI"
+      ],
+      "missing_binance": []
+    }
+  },
+  "meta": {
+    "binance_endpoint": "https://data-api.binance.vision",
+    "mode": "deep",
+    "sizing_in_scanner": true,
+    "no_data_breakdown": {
+      "short_history": 9,
+      "tf_missing": 0,
+      "liquidity_or_filters": 39,
+      "ok": 176
+    }
+  }
+}
