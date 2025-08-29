@@ -29,10 +29,8 @@ def log(msg: str) -> None:
 
 def load_state() -> dict:
     if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        try: return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception: return {}
     return {}
 
 def save_state(state: dict) -> None:
@@ -55,50 +53,41 @@ def fetch_summary() -> dict | None:
 def near(a: float, b: float, tol: float) -> bool:
     return abs(a - b) <= tol * max(1e-12, b)
 
-def get_spot_usdc_balance() -> tuple[float, float, float]:
-    """Return (free, locked, total) for QUOTE_ASSET on Spot."""
-    acct = client.get_account()
+def get_spot_balance(asset: str) -> tuple[float, float, float]:
+    """free, locked, total for Spot wallet."""
+    try:
+        acct = client.get_account()
+    except Exception as e:
+        log(f"[ACCOUNT ERROR] {e}")
+        return 0.0, 0.0, 0.0
     free = locked = 0.0
     for b in acct.get("balances", []):
-        if b.get("asset") == QUOTE_ASSET:
+        if b.get("asset") == asset:
             free = float(b.get("free", "0"))
             locked = float(b.get("locked", "0"))
             break
     return free, locked, free + locked
 
 def equity_for_sizing() -> float:
-    """Use override if set; else use FREE balance (tradable)."""
     if FORCE_EQUITY > 0:
         return FORCE_EQUITY
-    free, _, _ = get_spot_usdc_balance()
+    free, _, _ = get_spot_balance(QUOTE_ASSET)
     return free
 
 def place_order(sym: str, entry: float, stop: float, t1: float, t2: float) -> float:
-    # print balances every time
-    free, locked, total = get_spot_usdc_balance()
-    if FORCE_EQUITY > 0:
-        log(f"Balance check: OVERRIDE {FORCE_EQUITY:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
-    else:
-        log(f"Balance check: live free={free:.2f}, locked={locked:.2f}, total={total:.2f} {QUOTE_ASSET}")
-
     eq = equity_for_sizing()
     log(f"Equity used for sizing ({QUOTE_ASSET}): {eq:.2f}")
-
     risk = eq * RISK_PCT
-    risk_per_unit = max(entry - stop, entry * 0.002)
-    if risk_per_unit <= 0:
+    rpu = max(entry - stop, entry * 0.002)
+    if rpu <= 0:
         log(f"[SKIP] {sym} invalid risk_per_unit")
         return 0.0
-
-    raw_qty = risk / risk_per_unit
-    raw_qty = max(raw_qty, MIN_NOTIONAL / max(entry, 1e-12))
-    # round down a bit to avoid precision issues
-    raw_qty = math.floor(raw_qty * 1000000) / 1000000
-
+    raw_qty = max(risk / rpu, MIN_NOTIONAL / max(entry, 1e-12))
+    raw_qty = math.floor(raw_qty * 1_000_000) / 1_000_000
     notional = raw_qty * entry
     if notional < MIN_NOTIONAL:
         raw_qty = MIN_NOTIONAL / entry
-        raw_qty = math.floor(raw_qty * 1000000) / 1000000
+        raw_qty = math.floor(raw_qty * 1_000_000) / 1_000_000
         notional = raw_qty * entry
 
     if DRY_RUN:
@@ -108,19 +97,33 @@ def place_order(sym: str, entry: float, stop: float, t1: float, t2: float) -> fl
     try:
         order = client.order_market_buy(symbol=sym, quantity=raw_qty)
         log(f"[LIVE ENTRY] {sym} market buy qty={raw_qty:.6f} notional≈{notional:.2f}")
+        return raw_qty
     except Exception as e:
         log(f"[ENTRY ERROR] {sym}: {e}")
         return 0.0
 
-    return raw_qty
-
 def main():
-    S = fetch_summary()
-    if not S:
-        return
+    # ALWAYS print balances first
+    free, locked, total = get_spot_balance(QUOTE_ASSET)
+    if FORCE_EQUITY > 0:
+        log(f"Balance check: OVERRIDE {FORCE_EQUITY:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
+    else:
+        log(f"Balance check: live free={free:.2f}, locked={locked:.2f}, total={total:.2f} {QUOTE_ASSET}")
 
+    S = fetch_summary()
     state = load_state()
     state["_last_run"] = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    state["_last_balance"] = {
+        "asset": QUOTE_ASSET,
+        "free": round(free, 8),
+        "locked": round(locked, 8),
+        "total": round(total, 8),
+        "override": FORCE_EQUITY if FORCE_EQUITY > 0 else None,
+    }
+
+    if not S:
+        save_state(state)
+        return
 
     if S.get("signals", {}).get("type") != "B":
         log("Hold and wait.")
@@ -137,7 +140,6 @@ def main():
         sym = o["symbol"]
         if not sym.endswith(QUOTE_ASSET):
             continue
-
         entry = float(o["entry"]); stop = float(o["stop"])
         t1 = float(o["t1"]); t2 = float(o["t2"])
 
