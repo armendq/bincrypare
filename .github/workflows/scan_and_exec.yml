@@ -2,7 +2,7 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/7 * * * *"   # avoid overlap
+    - cron: "*/7 * * * *"     # every 7 minutes to avoid overlap
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   run:
-    runs-on: [self-hosted]          # your Hetzner runner
+    runs-on: [self-hosted]    # your Hetzner runner
     timeout-minutes: 30
 
     steps:
@@ -49,11 +49,7 @@ jobs:
           set -euo pipefail
           python -m scripts.analyses --mode deep
           test -s public_runs/latest/summary.json
-          python - <<'PY'
-          import json,sys
-          p=json.load(open("public_runs/latest/summary.json"))
-          print("signals:", p.get("signals"), "regime:", p.get("regime"))
-          PY
+          python -c "import json; p=json.load(open('public_runs/latest/summary.json')); print('signals:', p.get('signals'),'regime:',p.get('regime'))"
 
       - name: Commit public_runs
         run: |
@@ -61,10 +57,14 @@ jobs:
           git config --global safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
-          git fetch origin main
-          git pull --rebase origin main || true
+
+          # stage & commit first
           git add public_runs
           git diff --cached --quiet || git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          # sync with remote safely
+          git fetch origin main
+          git pull --rebase --autostash origin main || true
           git push origin HEAD:main || true
 
       # ---------- EXECUTOR ----------
@@ -89,11 +89,12 @@ jobs:
           git config --global safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
-          git fetch origin main
-          git pull --rebase origin main || true
+
           if [ -f state/open_positions.json ]; then
             git add state/open_positions.json
             git diff --cached --quiet || git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git fetch origin main
+            git pull --rebase --autostash origin main || true
             git push origin HEAD:main || true
           else
             echo "No state file to persist."
