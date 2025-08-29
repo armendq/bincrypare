@@ -50,10 +50,10 @@ jobs:
           python -m scripts.analyses --mode deep
           test -s public_runs/latest/summary.json
           python - <<'PY'
-import json,sys
-p=json.load(open("public_runs/latest/summary.json"))
-print("signals:", p.get("signals"), "regime:", p.get("regime"))
-PY
+          import json,sys
+          p=json.load(open("public_runs/latest/summary.json"))
+          print("signals:", p.get("signals"), "regime:", p.get("regime"))
+          PY
 
       - name: Commit public_runs
         run: |
