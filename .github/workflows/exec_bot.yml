@@ -1,32 +1,31 @@
 name: exec-bot
+
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch:
 
 jobs:
-  run:
+  trade:
     runs-on: [self-hosted]
-    permissions:
-      contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
       - name: Install deps
-        run: pip install -r requirements.txt
-      - name: Run bot (dry-run)
+        run: pip install requests python-binance
+
+      - name: Run bot
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "0"
+          DRY_RUN: "0"                # set 0 for live trading
+          FORCE_EQUITY_USD: "30"      # pretend only 30 USDC available
+          QUOTE_ASSET: "USDC"         # only act on …USDC pairs
         run: python exec_bot.py
-      - name: Persist state
-        run: |
-          git config user.name "bincrypare-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add state/open_positions.json || true
-          git commit -m "state: update open positions" || true
-          git push || true
