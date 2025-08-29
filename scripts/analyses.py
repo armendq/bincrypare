@@ -18,6 +18,7 @@ import json
 import statistics
 import time
 import traceback
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,12 +52,14 @@ EMA_FAST = 20
 EMA_SLOW = 200
 SWING_LOOKBACK = 20  # HH20 / LL20
 
-# Pre-breakout heuristics
-PROX_ATR_MIN = 0.05
-PROX_ATR_MAX = 0.35
-VOL_Z_MIN_PRE = 1.2
-VOL_Z_MIN_BREAK = 1.8
-BREAK_BUFFER_ATR = 0.10
+# Pre-breakout heuristics (env-overridable)
+PROX_ATR_MIN    = float(os.getenv("PROX_ATR_MIN",    "0.05"))
+PROX_ATR_MAX    = float(os.getenv("PROX_ATR_MAX",    "0.35"))
+VOL_Z_MIN_PRE   = float(os.getenv("VOL_Z_MIN_PRE",   "1.2"))
+VOL_Z_MIN_BREAK = float(os.getenv("VOL_Z_MIN_BREAK", "1.5"))   # relaxed default
+BREAK_BUFFER_ATR= float(os.getenv("BREAK_BUFFER_ATR","0.06"))  # relaxed default
+RELAX_B_HIGH    = os.getenv("RELAX_B_HIGH","1") == "1"         # use 1h HIGH for confirmation
+
 
 # Ranking
 MAX_CANDIDATES = 10
@@ -278,9 +281,11 @@ def analyze_symbol(symbol: str, btc_1h_close: List[float]) -> Optional[dict]:
         score += 0.5
 
     breakout_level = hh20[-1]
+    last_high = high_1h[-1]
+    confirm_price = last_high if RELAX_B_HIGH else last_close
     confirmed_breakout = (
         trend_ok
-        and last_close > (breakout_level + BREAK_BUFFER_ATR * last_atr)
+        and confirm_price > (breakout_level + BREAK_BUFFER_ATR * last_atr)
         and vz >= VOL_Z_MIN_BREAK
         and lower_tf_ok
     )
