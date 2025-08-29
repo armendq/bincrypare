@@ -4,23 +4,12 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      force_mode:
-        description: "Override mode: deep | light-hourly | light-fast | skip | auto"
-        required: false
-        default: "auto"
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 env:
   PYTHONUNBUFFERED: "1"
-
-concurrency:
-  group: analyses-main
-  cancel-in-progress: true
 
 jobs:
   run:
@@ -38,185 +27,42 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+          pip install requests
 
-      - name: Ensure output tree
+      - name: Marker
         run: |
-          set -euo pipefail
-          mkdir -p public_runs/latest
-          mkdir -p mapping
+          python - <<'PY'
+          import importlib
+          m = importlib.import_module("scripts.analyses")
+          print("ANALYSES_MARKER","USDC","BTC_REF","BTCUSDC" in open("scripts/analyses.py","r").read())
+          PY
 
-      - name: Generate Revolut ↔ Binance mapping (optional)
-        run: |
-          set -e
-          if [ -f scripts/generate_mapping.py ]; then
-            echo "[mapping] generating…"
-            python scripts/generate_mapping.py
-          else
-            echo "[mapping] no generator found; skipping."
-          fi
-
-      # -------- Decide cadence --------
-      - name: Decide run mode (deep / light-fast / light-hourly)
-        id: decide
-        shell: bash
-        run: |
-          set -euo pipefail
-          FORCE="${{ github.event.inputs.force_mode || '' }}"
-          if [[ -n "${FORCE}" && "${FORCE}" != "auto" ]]; then
-            echo "mode=${FORCE}" >> "$GITHUB_OUTPUT"
-            echo "Override -> ${FORCE}"
-            exit 0
-          fi
-          M=$(date -u +%M); M=$((10#$M))
-          within() { local m=$1 t=$2 tol=${3:-1}; local d=$(( (m - t + 60) % 60 )); [[ $d -le $tol || $((60-d)) -le $tol ]]; }
-          MODE=""
-          for t in 0 15 30 45; do if within "$M" "$t" 1; then MODE="deep"; break; fi; done
-          if [[ -z "$MODE" ]] && within "$M" 2 1; then MODE="light-hourly"; fi
-          if [[ -z "$MODE" ]]; then
-            for t in 0 5 10 15 20 25 30 35 40 45 50 55; do
-              if within "$M" "$t" 1; then MODE="light-fast"; break; fi
-            done
-          fi
-          [[ -z "$MODE" ]] && MODE="skip"
-          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
-          echo "Selected mode: ${MODE} (UTC minute=${M})"
-
-      - name: Skip if no matching cadence
-        if: steps.decide.outputs.mode == 'skip'
-        run: echo "No matching cadence window now; exiting."
-
-      # -------- Analyses --------
       - name: Run analyses (deep)
-        if: steps.decide.outputs.mode == 'deep'
         run: |
-          set -euo pipefail
-          echo "[router] Running DEEP analyses"
           python -m scripts.analyses --mode deep
 
-      - name: Run analyses (light-fast)
-        if: steps.decide.outputs.mode == 'light-fast'
+      - name: Validate summary.json
         run: |
-          set -euo pipefail
-          echo "[router] Running LIGHT-FAST analyses"
-          python -m scripts.analyses --mode light-fast
-
-      - name: Run analyses (light-hourly)
-        if: steps.decide.outputs.mode == 'light-hourly'
-        run: |
-          set -euo pipefail
-          echo "[router] Running LIGHT-HOURLY analyses"
-          python -m scripts.analyses --mode light-hourly
-
-      # -------- Validate local output BEFORE committing --------
-      - name: Validate summary.json (local)
-        if: steps.decide.outputs.mode != 'skip'
-        run: |
-          set -euo pipefail
           FILE="public_runs/latest/summary.json"
-          if [ ! -s "$FILE" ]; then
-            echo "ERROR: $FILE missing or empty"
-            ls -lah public_runs/latest || true
-            exit 1
-          fi
-          if ! jq -e . "$FILE" >/dev/null 2>&1; then
-            echo "ERROR: $FILE invalid JSON"
-            sed -n '1,200p' "$FILE" || true
-            exit 1
-          fi
-          echo "✔ Local summary.json present and valid."
+          test -s "$FILE"
+          python - <<'PY'
+          import json
+          d=json.load(open("public_runs/latest/summary.json"))
+          assert "missing_binance" in d["universe"]["skipped"]
+          assert d["universe"]["skipped"]["missing_binance"]==[], d["universe"]["skipped"]["missing_binance"]
+          print("summary ok; signals:", d["signals"]["type"])
+          PY
 
-      # -------- Commit to main with rebase to avoid non-fast-forward --------
-      - name: Commit public_runs to main
-        if: steps.decide.outputs.mode != 'skip'
-        shell: bash
+      - name: Commit summary with rebase
         run: |
-          set -euo pipefail
           git config --global safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "bincrypare-bot"
           git config user.email "bot@users.noreply.github.com"
-
-          ADD_LIST=()
-          [ -d public_runs ] && ADD_LIST+=("public_runs")
-          [ -d mapping ] && ADD_LIST+=("mapping")
-
-          # Commit locally if there are changes
-          if [ ${#ADD_LIST[@]} -gt 0 ]; then
-            git add "${ADD_LIST[@]}" || true
-          fi
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore(run): artifacts $(date -u +'%Y-%m-%dT%H:%M:%SZ') [${{ steps.decide.outputs.mode }}]"
-          fi
-
-          # Always rebase onto latest remote before pushing to avoid rejection
+          git add public_runs
+          git diff --cached --quiet || git commit -m "chore(run): $(date -u +'%Y-%m-%dT%H:%M:%SZ') [deep]"
           git fetch origin main
           git pull --rebase origin main || true
-
-          # Push
           git push origin HEAD:main || true
-
-      # -------- Verify RAW (the URL your consumer hits) --------
-      - name: Verify RAW summary.json (retry)
-        if: steps.decide.outputs.mode != 'skip'
-        env:
-          RAW_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/public_runs/latest/summary.json
-        run: |
-          set -euo pipefail
-          echo "RAW_URL=$RAW_URL"
-          for i in 1 2 3 4 5; do
-            echo "Attempt $i to fetch RAW summary.json"
-            if curl -sSfL -H 'Cache-Control: no-cache' "$RAW_URL" -o /tmp/summary.json; then
-              if jq -e . /tmp/summary.json >/dev/null 2>&1; then
-                echo "✔ RAW summary.json reachable and valid."
-                exit 0
-              else
-                echo "WARN: RAW JSON invalid; retrying."
-              fi
-            else
-              echo "WARN: curl failed; retrying."
-            fi
-            sleep $((i*3))
-          done
-          echo "NOTE: RAW verification failed after retries (may be transient). Proceeding."
-
-      # -------- Deploy to GH Pages (optional browsing) --------
-      - name: Upload Pages artifact
-        if: steps.decide.outputs.mode != 'skip'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public_runs
-
-      - name: Deploy to gh-pages
-        if: steps.decide.outputs.mode != 'skip'
-        id: deploy
-        uses: actions/deploy-pages@v4
-
-      - name: Verify Pages endpoint (non-blocking)
-        if: always() && steps.decide.outputs.mode != 'skip'
-        continue-on-error: true
-        env:
-          PAGES_URL: ${{ steps.deploy.outputs.page_url }}
-        run: |
-          set -euo pipefail
-          BASE="${PAGES_URL:-https://armendq.github.io/bincrypare/}"
-          SUM="${BASE%/}/latest/summary.json"
-          echo "Checking base: $BASE"
-          curl -I --max-time 20 --retry 3 --retry-delay 5 "$BASE" || true
-          echo "Checking Pages summary: $SUM"
-          curl --max-time 20 --retry 5 --retry-delay 5 -H 'Cache-Control: no-cache' "$SUM" | jq -e . >/dev/null 2>&1 && echo "Pages JSON ok" || echo "Pages JSON not ready yet"
