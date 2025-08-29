@@ -2,7 +2,7 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/7 * * * *"     # every 7 minutes to avoid overlap
+    - cron: "*/17 * * * *"     # every 17 minutes to avoid overlap
   workflow_dispatch:
 
 permissions:
