@@ -18,6 +18,10 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
 
+concurrency:
+  group: analyses-main
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -135,28 +139,37 @@ jobs:
           fi
           echo "✔ Local summary.json present and valid."
 
-      # -------- Commit to main (the raw URL serves from here) --------
+      # -------- Commit to main with rebase to avoid non-fast-forward --------
       - name: Commit public_runs to main
         if: steps.decide.outputs.mode != 'skip'
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "bincrypare-bot"
+          git config user.email "bot@users.noreply.github.com"
+
           ADD_LIST=()
           [ -d public_runs ] && ADD_LIST+=("public_runs")
           [ -d mapping ] && ADD_LIST+=("mapping")
-          if [ ${#ADD_LIST[@]} -eq 0 ]; then
-            echo "Nothing to add."
-            exit 0
+
+          # Commit locally if there are changes
+          if [ ${#ADD_LIST[@]} -gt 0 ]; then
+            git add "${ADD_LIST[@]}" || true
           fi
-          git add "${ADD_LIST[@]}" || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             git commit -m "chore(run): artifacts $(date -u +'%Y-%m-%dT%H:%M:%SZ') [${{ steps.decide.outputs.mode }}]"
-            git push
           fi
+
+          # Always rebase onto latest remote before pushing to avoid rejection
+          git fetch origin main
+          git pull --rebase origin main || true
+
+          # Push
+          git push origin HEAD:main || true
 
       # -------- Verify RAW (the URL your consumer hits) --------
       - name: Verify RAW summary.json (retry)
@@ -166,7 +179,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "RAW_URL=$RAW_URL"
-          # Retry the raw URL with no-cache and backoff
           for i in 1 2 3 4 5; do
             echo "Attempt $i to fetch RAW summary.json"
             if curl -sSfL -H 'Cache-Control: no-cache' "$RAW_URL" -o /tmp/summary.json; then
@@ -174,16 +186,16 @@ jobs:
                 echo "✔ RAW summary.json reachable and valid."
                 exit 0
               else
-                echo "WARN: RAW JSON invalid; will retry."
+                echo "WARN: RAW JSON invalid; retrying."
               fi
             else
-              echo "WARN: curl failed; will retry."
+              echo "WARN: curl failed; retrying."
             fi
             sleep $((i*3))
           done
           echo "NOTE: RAW verification failed after retries (may be transient). Proceeding."
 
-      # -------- Deploy to GH Pages (still useful for browsing) --------
+      # -------- Deploy to GH Pages (optional browsing) --------
       - name: Upload Pages artifact
         if: steps.decide.outputs.mode != 'skip'
         uses: actions/upload-pages-artifact@v3
@@ -195,7 +207,6 @@ jobs:
         id: deploy
         uses: actions/deploy-pages@v4
 
-      # -------- Verify Pages (non-blocking) --------
       - name: Verify Pages endpoint (non-blocking)
         if: always() && steps.decide.outputs.mode != 'skip'
         continue-on-error: true
