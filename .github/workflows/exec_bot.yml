@@ -29,7 +29,7 @@ jobs:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
           DRY_RUN: "1"                # set "0" for live trading
-          FORCE_EQUITY_USD: "30"      # simulate 30 USDC balance
+          FORCE_EQUITY_USD: "0"      # simulate 30 USDC balance
           QUOTE_ASSET: "USDC"         # scan/trade only ...USDC pairs
         run: python exec_bot.py
 
