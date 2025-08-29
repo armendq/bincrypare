@@ -4,13 +4,14 @@
 import os, json, time, math, requests
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional, Tuple, Dict, Any
 from binance.client import Client
 from binance.enums import (
     SIDE_BUY, SIDE_SELL, TIME_IN_FORCE_GTC,
     ORDER_TYPE_MARKET, ORDER_TYPE_STOP_LOSS_LIMIT, ORDER_TYPE_LIMIT
 )
 
-# env
+# -------------------- ENV --------------------
 SUMMARY_URL       = os.getenv("SUMMARY_URL", "https://raw.githubusercontent.com/armendq/bincrypare/main/public_runs/latest/summary.json")
 QUOTE_ASSET       = os.getenv("QUOTE_ASSET", "USDC")
 DRY_RUN           = os.getenv("DRY_RUN", "1") == "1"
@@ -29,24 +30,27 @@ STATE_FILE = STATE_DIR / "open_positions.json"
 
 client = Client(API_KEY, API_SECRET)
 
+# -------------------- HELPERS --------------------
 def now_str() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 def log(msg: str) -> None:
     print(f"[exec {now_str()}] {msg}", flush=True)
 
-def load_state() -> dict:
+def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
-        try: return json.loads(STATE_FILE.read_text("utf-8"))
-        except Exception: return {}
+        try:
+            return json.loads(STATE_FILE.read_text("utf-8"))
+        except Exception:
+            return {}
     return {}
 
-def save_state(state: dict) -> None:
+def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_DIR / "open_positions.tmp"
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), "utf-8")
     tmp.replace(STATE_FILE)
 
-def fetch_summary() -> dict | None:
+def fetch_summary() -> Optional[Dict[str, Any]]:
     if SUMMARY_URL.startswith("file://"):
         try:
             p = SUMMARY_URL.replace("file://", "", 1)
@@ -66,7 +70,7 @@ def fetch_summary() -> dict | None:
     log("Hold and wait. Fetch failed twice.")
     return None
 
-def get_spot_balance(asset: str) -> tuple[float, float, float]:
+def get_spot_balance(asset: str) -> Tuple[float, float, float]:
     try:
         acct = client.get_account()
     except Exception as e:
@@ -86,7 +90,7 @@ def equity_for_sizing() -> float:
     free, _, _ = get_spot_balance(QUOTE_ASSET)
     return free
 
-def get_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
+def get_symbol_filters(symbol: str) -> Tuple[float, float, float, float]:
     info = client.get_symbol_info(symbol)
     lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
     pricef = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
@@ -102,7 +106,8 @@ def round_to_tick(p: float, tick: float) -> float:
     if tick <= 0: return p
     return floor_to_step(p, tick)
 
-def compute_qty(entry: float, stop: float, equity: float, min_qty: float, step_qty: float, min_notional: float) -> float:
+def compute_qty(entry: float, stop: float, equity: float,
+                min_qty: float, step_qty: float, min_notional: float) -> float:
     risk_dollars = equity * RISK_PCT
     rpu = max(entry - stop, entry * 0.002)
     if rpu <= 0: return 0.0
@@ -111,7 +116,8 @@ def compute_qty(entry: float, stop: float, equity: float, min_qty: float, step_q
     if qty < min_qty: return 0.0
     return qty
 
-def place_market_buy(symbol: str, qty: float) -> dict | None:
+# -------------------- ORDER PLACEMENT --------------------
+def place_market_buy(symbol: str, qty: float) -> Optional[Dict[str, Any]]:
     if DRY_RUN:
         log(f"[MARKET BUY dry] {symbol} qty={qty:.8f}")
         return {"orderId":"dry"}
@@ -123,7 +129,7 @@ def place_market_buy(symbol: str, qty: float) -> dict | None:
         log(f"[ENTRY ERROR] {symbol}: {e}")
         return None
 
-def place_stop_limit_buy(symbol: str, qty: float, entry: float, tick: float) -> dict | None:
+def place_stop_limit_buy(symbol: str, qty: float, entry: float, tick: float) -> Optional[Dict[str, Any]]:
     stop_px  = round_to_tick(entry, tick)
     limit_px = round_to_tick(entry * (1 + STOP_LIMIT_OFFSET), tick)
     if DRY_RUN:
@@ -158,6 +164,7 @@ def place_tp_limits(symbol: str, qty: float, t1: float, t2: float, tick: float) 
     except Exception as e:
         log(f"[TP ERROR] {symbol}: {e}")
 
+# -------------------- MAIN LOOP --------------------
 def main():
     free, locked, total = get_spot_balance(QUOTE_ASSET)
     if FORCE_EQUITY > 0:
@@ -173,7 +180,7 @@ def main():
     state["_last_run"] = now_str()
     state["_last_balance"] = {"asset": QUOTE_ASSET, "free": round(free,8), "locked": round(locked,8), "total": round(total,8)}
 
-    # Candidates -> stop-limit buy at entry (reduced risk)
+    # Candidates -> stop-limit buy
     if TRADE_CANDS:
         eq_c = equity_for_sizing() * max(0.0, C_RISK_MULT)
         for c in S.get("candidates", []):
