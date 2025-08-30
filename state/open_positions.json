@@ -1,9 +1,9 @@
 {
-  "_last_run": "2025-08-30 18:06:14",
+  "_last_run": "2025-08-30 18:25:30",
   "_last_balance": {
     "asset": "USDC",
-    "free": 3.00042386,
-    "locked": 15.0281119,
+    "free": 18.02853576,
+    "locked": 0.0,
     "total": 18.02853576
   },
   "PHAUSDC": {
@@ -16,7 +16,11 @@
     "status": "closed",
     "entry_order_id": 21527974,
     "type": "C",
-    "tps_placed": true
+    "tps_placed": true,
+    "tick": 0.0001,
+    "step_qty": 1.0,
+    "min_qty": 1.0,
+    "min_notional": 6.0
   },
   "GMTUSDC": {
     "entry": 0.0432127,
@@ -27,7 +31,11 @@
     "t1_filled_qty": 0.0,
     "status": "canceled",
     "entry_order_id": 7421204,
-    "type": "C"
+    "type": "C",
+    "tick": 0.0001,
+    "step_qty": 0.1,
+    "min_qty": 0.1,
+    "min_notional": 6.0
   },
   "TONUSDC": {
     "entry": 3.13845626,
@@ -72,7 +80,7 @@
     "t2": 3.769e-05,
     "filled_qty": 0.0,
     "t1_filled_qty": 0.0,
-    "status": "pending",
+    "status": "dead",
     "entry_order_id": 75603497,
     "type": "C",
     "tps_placed": false,
@@ -92,7 +100,7 @@
     "step_qty": 1.0,
     "filled_qty": 0.0,
     "t1_filled_qty": 0.0,
-    "status": "pending",
+    "status": "dead",
     "entry_order_id": 66281454,
     "type": "C",
     "created_at": 1756567533.202124,
