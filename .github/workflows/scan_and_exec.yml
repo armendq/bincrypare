@@ -39,7 +39,7 @@ env:
 
   # Executor knobs
   ALLOW_MIN_ORDER: "1"
-  MIN_ORDER_USD: "6"
+  MIN_ORDER_USD: "10"
   PENDING_TTL_H: "3"
   EARLY_CANCEL_R: "0.5"
   LIVE_TTL_H: "36"
