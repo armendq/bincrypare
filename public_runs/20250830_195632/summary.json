@@ -1,0 +1,126 @@
+{
+  "generated_at": "2025-08-30 19:55:01 CEST",
+  "timezone": "Europe/Prague",
+  "regime": {
+    "ok": true,
+    "reason": "Regime ignored by flag"
+  },
+  "signals": {
+    "type": "C"
+  },
+  "orders": [],
+  "candidates": [
+    {
+      "ticker": "POL",
+      "symbol": "POLUSDC",
+      "last": 0.256,
+      "atr": 0.00375207,
+      "entry": 0.25647504,
+      "stop": 0.23567438,
+      "t1": 0.2594767,
+      "t2": 0.26210315,
+      "score": 12.6724,
+      "vol_z": 1.79,
+      "prox_atr": 0.107,
+      "rs10": 0.0463,
+      "tf": "1h",
+      "notes": [
+        "TrendOK(1h&4h)",
+        "ATR up",
+        "VolZ=1.79",
+        "LowerTF OK",
+        "RS=0.05"
+      ],
+      "rotation_exempt": false,
+      "position_size": 4807.53886449,
+      "position_size_usdc": 1233.01
+    },
+    {
+      "ticker": "KMNO",
+      "symbol": "KMNOUSDC",
+      "last": 0.05647,
+      "atr": 0.00054276,
+      "entry": 0.05684086,
+      "stop": 0.05455717,
+      "t1": 0.05727506,
+      "t2": 0.057655,
+      "score": 3.4399,
+      "vol_z": 1.02,
+      "prox_atr": 0.663,
+      "rs10": 0.0007,
+      "tf": "1h",
+      "notes": [
+        "VolZ=1.02",
+        "LowerTF OK",
+        "RS=0.00"
+      ],
+      "rotation_exempt": false,
+      "position_size": 43788.91135017,
+      "position_size_usdc": 2489.0
+    }
+  ],
+  "universe": {
+    "scanned": 224,
+    "eligible": 224,
+    "skipped": {
+      "no_data": [
+        "A2Z",
+        "ANIME",
+        "BROCCOLI714",
+        "CVC",
+        "CVX",
+        "CYBER",
+        "DOGS",
+        "DOLO",
+        "FUN",
+        "HIVE",
+        "ILV",
+        "KAIA",
+        "LISTA",
+        "MAGIC",
+        "MASK",
+        "MAV",
+        "MITO",
+        "MOVE",
+        "PLUME",
+        "PROVE",
+        "PUNDIX",
+        "RVN",
+        "SIGN",
+        "SKL",
+        "SSV",
+        "STEEM",
+        "T",
+        "TLM",
+        "TOWNS",
+        "TREE",
+        "UMA",
+        "VANA"
+      ],
+      "missing_binance": []
+    }
+  },
+  "meta": {
+    "params": {
+      "ATR_LEN": 14,
+      "EMA_FAST": 20,
+      "EMA_SLOW": 200,
+      "SWING_LOOKBACK": 20,
+      "PROX_ATR_MIN": 0.0,
+      "PROX_ATR_MAX": 1.0,
+      "VOL_Z_MIN_PRE": 0.5,
+      "VOL_Z_MIN_BREAK": 0.7,
+      "BREAK_BUFFER_ATR": 0.02,
+      "ALLOW_RUNAWAY_ATR": 3.0,
+      "MAX_CANDIDATES": 10,
+      "MIN_AVG_VOL": 1000.0,
+      "CAPITAL": 10000.0,
+      "RISK_PER_TRADE": 0.01,
+      "RELAXED_SIGNALS": true
+    },
+    "lower_tf_confirm": true,
+    "rs_reference": "BTCUSDC",
+    "binance_endpoint": "https://data-api.binance.vision",
+    "mode": "deep"
+  }
+}
