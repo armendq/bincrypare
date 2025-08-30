@@ -2,7 +2,7 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/4 * * * *"
   workflow_dispatch:
     inputs:
       ignore_regime:
