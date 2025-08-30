@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Analyses pipeline – USDC universe (breakouts & pre-breakouts).
+Analyses pipeline – scanner for pre-breakouts and breakouts (USDC universe)
 
-- Universe: all Binance Spot pairs with quoteAsset == USDC (ex-stables, ex-leveraged)
-- RS baseline: BTCUSDC (can be ignored with --ignore_regime)
-- Parallel data fetch for 4h/1h/15m/5m
-- Candidate ranking & JSON output to public_runs/latest/summary.json
-- NEW: size feasibility check (minQty / stepSize / (MIN_)NOTIONAL) so we don't suggest
-       trades that Binance will reject for too-small notional/precision.
+- Universe: all Binance Spot pairs with quoteAsset == USDC (TRADING, non-stable, non-leveraged)
+- BTC reference: BTCUSDC
+- Signals:
+    B  = confirmed breakout
+    C  = pre-breakout / continuation (optionally allows slight post-HH20 proximity)
+- Output: public_runs/latest/summary.json and timestamped copy under public_runs/YYYYmmdd_HHMMSS/
+- Notes:
+    * 'missing_binance' is always [] to keep downstream contract stable.
+    * Environment variables control thresholds; RELAXED_SIGNALS auto-widens gates.
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import random
 import statistics
@@ -32,13 +34,13 @@ import numpy as np
 import requests
 
 try:
-    from zoneinfo import ZoneInfo  # py3.9+
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
     ZoneInfo = None
 
 # ----------------------------- CONFIG ---------------------------------
 
-TZ_NAME = "Europe/Prague"
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Prague")
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else timezone.utc
 
 BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision")
@@ -51,40 +53,42 @@ INTERVALS = {
     "5m": ("5m", 400),
 }
 
-# ATR / EMA
-ATR_LEN = 14
-EMA_FAST = 20
-EMA_SLOW = 200
-SWING_LOOKBACK = 20
+# Core params (env-overridable)
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "20"))
 
-# Heuristics (env-overridable)
-PROX_ATR_MIN = float(os.getenv("PROX_ATR_MIN", "0.05"))
-PROX_ATR_MAX = float(os.getenv("PROX_ATR_MAX", "0.35"))
-VOL_Z_MIN_PRE = float(os.getenv("VOL_Z_MIN_PRE", "1.0"))
-VOL_Z_MIN_BREAK = float(os.getenv("VOL_Z_MIN_BREAK", "1.2"))
-BREAK_BUFFER_ATR = float(os.getenv("BREAK_BUFFER_ATR", "0.05"))
-RELAX_B_HIGH = os.getenv("RELAX_B_HIGH", "0") == "1"    # confirm with last 1h HIGH if true
+# Heuristics / thresholds (env)
+PROX_ATR_MIN = float(os.getenv("PROX_ATR_MIN", "0.00"))     # allow negative if you want continuation C
+PROX_ATR_MAX = float(os.getenv("PROX_ATR_MAX", "0.70"))
+VOL_Z_MIN_PRE = float(os.getenv("VOL_Z_MIN_PRE", "0.7"))
+VOL_Z_MIN_BREAK = float(os.getenv("VOL_Z_MIN_BREAK", "0.9"))
+BREAK_BUFFER_ATR = float(os.getenv("BREAK_BUFFER_ATR", "0.04"))
+RELAX_B_HIGH = os.getenv("RELAX_B_HIGH", "0") == "1"        # confirm by 1h high instead of close
+ALLOW_RUNAWAY_ATR = float(os.getenv("ALLOW_RUNAWAY_ATR", "3.0"))  # allow B up to K*ATR above HH20
+
+# Liquidity / sizing metadata (advisory only)
+MIN_AVG_VOL = float(os.getenv("MIN_AVG_VOL", "2500"))  # approx USDC across last 10 x 1h bars
+CAPITAL = float(os.getenv("CAPITAL", "10000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+
+# Relaxations switch
 RELAXED_SIGNALS = os.getenv("RELAXED_SIGNALS", "0") == "1"
 
-# Liquidity / sizing assumptions for feasibility filter
-MIN_AVG_VOL = float(os.getenv("MIN_AVG_VOL", "2500"))             # USDC over last 10 1h bars
-CAPITAL = float(os.getenv("CAPITAL", "10000"))                    # used for advisory sizing
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))       # 1%
-ANALYSES_EQUITY_USDC = float(os.getenv("ANALYSES_EQUITY_USDC", "30"))
-MIN_NOTIONAL_FALLBACK = float(os.getenv("MIN_NOTIONAL_FALLBACK", "5.0"))
-
-# Score / logging
-MAX_CANDIDATES = 10
+# Execution / logging
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "10"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
 NEAR_MISS_LOG_COUNT = int(os.getenv("NEAR_MISS_LOG_COUNT", "5"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="[%(asctime)s] %(message)s")
 
 # Filters
 STABLES = {"USDT", "USDC", "DAI", "TUSD", "USDP", "BUSD", "FDUSD", "PYUSD"}
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "2L", "2S", "3L", "3S", "4L", "4S", "5L", "5S")
 
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-                    format="[%(asctime)s] %(message)s")
-
-# -------------------------- HTTP / UTILS ------------------------------
+# -------------------------- HELPERS -----------------------------------
 
 def human_time(ts: Optional[datetime] = None) -> str:
     dt = ts or datetime.now(timezone.utc).astimezone(TZ)
@@ -105,57 +109,52 @@ def safe_get(url: str, params: Optional[dict] = None, retries: int = 3, timeout:
             time.sleep(sleep_s * attempt)
     return None
 
-# -------------------------- TA HELPERS --------------------------------
-
 def ema(series: np.ndarray, period: int) -> np.ndarray:
-    if len(series) == 0 or period <= 1:
+    if series.size == 0 or period <= 1:
         return series
     alpha = 2.0 / (period + 1.0)
     out = np.empty_like(series)
     out[0] = series[0]
-    for i in range(1, len(series)):
-        out[i] = alpha * series[i] + (1 - alpha) * out[i-1]
+    for i in range(1, series.size):
+        out[i] = alpha * series[i] + (1 - alpha) * out[i - 1]
     return out
 
 def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = ATR_LEN) -> np.ndarray:
-    if len(highs) < 2:
+    if highs.size < 2:
         return np.zeros_like(highs)
-    tr1 = highs[1:] - lows[1:]
-    tr2 = np.abs(highs[1:] - closes[:-1])
-    tr3 = np.abs(lows[1:] - closes[:-1])
-    trs = np.insert(np.maximum(tr1, np.maximum(tr2, tr3)), 0, 0.0)
-    return ema(trs, period)
+    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
+    tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
+    tr = np.insert(tr, 0, 0.0)  # align length
+    return ema(tr, period)
 
 def swing_high(series: np.ndarray, lookback: int) -> np.ndarray:
-    return np.array([np.max(series[max(0, i - lookback + 1): i + 1]) for i in range(len(series))])
+    return np.array([np.max(series[max(0, i - lookback + 1): i + 1]) for i in range(series.size)])
 
 def swing_low(series: np.ndarray, lookback: int) -> np.ndarray:
-    return np.array([np.min(series[max(0, i - lookback + 1): i + 1]) for i in range(len(series))])
+    return np.array([np.min(series[max(0, i - lookback + 1): i + 1]) for i in range(series.size)])
 
 def pct_change(series: np.ndarray, n: int) -> float:
-    if len(series) < n + 1:
+    if series.size < n + 1:
         return 0.0
-    a, b = series[-n - 1], series[-1]
-    if a == 0:
+    a, b = float(series[-n - 1]), float(series[-1])
+    if a == 0.0:
         return 0.0
     return (b - a) / a
 
 def vol_zscore(vols: np.ndarray, window: int = 50) -> float:
-    if len(vols) < window + 1:
+    if vols.size < window + 1:
         return 0.0
     sample = vols[-(window + 1):-1]
     mu = float(np.mean(sample))
     sd = float(np.std(sample, ddof=0))
-    if sd == 0:
+    if sd == 0.0:
         return 0.0
-    return (float(vols[-1]) - mu) / sd
+    return float((vols[-1] - mu) / sd)
 
-# ---------------------- UNIVERSE + FILTERS ----------------------------
-
-_SYMBOL_FILTERS: Dict[str, Dict[str, float]] = {}
+# -------------------------- DATA FETCH --------------------------------
 
 def fetch_exchange_usdc_symbols() -> Dict[str, dict]:
-    """exchangeInfo filtered to USDC spot symbols (ex-stable, ex-leveraged)."""
+    """Return dict of USDC spot symbols metadata keyed by symbol (e.g., 'LPTUSDC')."""
     url = f"{BASE_URL}/api/v3/exchangeInfo"
     r = safe_get(url, retries=3, timeout=25)
     if not r:
@@ -177,129 +176,163 @@ def fetch_exchange_usdc_symbols() -> Dict[str, dict]:
         out[s["symbol"]] = s
     return out
 
-def load_symbol_filters() -> Dict[str, Dict[str, float]]:
-    """Build {symbol: {min_qty, step_qty, tick, min_notional}} once."""
-    global _SYMBOL_FILTERS
-    if _SYMBOL_FILTERS:
-        return _SYMBOL_FILTERS
-    ex = fetch_exchange_usdc_symbols()
-    filt: Dict[str, Dict[str, float]] = {}
-    for sym, meta in ex.items():
-        min_qty = step_qty = tick = 0.0
-        min_notional = MIN_NOTIONAL_FALLBACK
-        for f in meta.get("filters", []):
-            t = f.get("filterType")
-            if t == "LOT_SIZE":
-                min_qty = float(f.get("minQty", "0"))
-                step_qty = float(f.get("stepSize", "0"))
-            elif t == "PRICE_FILTER":
-                tick = float(f.get("tickSize", "0"))
-            elif t in ("MIN_NOTIONAL", "NOTIONAL"):
-                try:
-                    min_notional = float(f.get("minNotional", MIN_NOTIONAL_FALLBACK))
-                except Exception:
-                    min_notional = MIN_NOTIONAL_FALLBACK
-        filt[sym] = {
-            "min_qty": max(0.0, min_qty),
-            "step_qty": max(0.0, step_qty),
-            "tick": max(0.0, tick),
-            "min_notional": max(MIN_NOTIONAL_FALLBACK, min_notional),
-        }
-    _SYMBOL_FILTERS = filt
-    return filt
-
 def fetch_klines(symbol: str, interval: str, limit: int, end_time: Optional[int] = None) -> Optional[List[List[Any]]]:
     url = f"{BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    if end_time:
+    if end_time is not None:
         params["endTime"] = end_time
     r = safe_get(url, params=params, retries=3, timeout=20)
     if not r:
         return None
     try:
         data = r.json()
-        return data if isinstance(data, list) else None
+        if isinstance(data, list):
+            return data
     except Exception:
         return None
+    return None
 
 def fetch_all_klines(symbols: List[str], interval: str, limit: int, end_time: Optional[int] = None) -> Dict[str, Optional[List[List[Any]]]]:
-    with ThreadPoolExecutor(max_workers=int(os.getenv("MAX_WORKERS", "12"))) as ex:
-        futures = {ex.submit(fetch_klines, s, interval, limit, end_time): s for s in symbols}
-        res: Dict[str, Optional[List[List[Any]]]] = {}
-        for fut in as_completed(futures):
-            sym = futures[fut]
+    results: Dict[str, Optional[List[List[Any]]]] = {}
+    if not symbols:
+        return results
+    with ThreadPoolExecutor(max_workers=max(1, min(MAX_WORKERS, len(symbols)))) as ex:
+        fut = {ex.submit(fetch_klines, sym, interval, limit, end_time): sym for sym in symbols}
+        for f in as_completed(fut):
+            sym = fut[f]
             try:
-                res[sym] = fut.result()
+                results[sym] = f.result()
             except Exception as e:
-                logging.warning(f"Failed klines {sym}: {e}")
-                res[sym] = None
-        return res
+                logging.warning(f"Failed klines for {sym}: {e}")
+                results[sym] = None
+    return results
 
 def parse_klines(raw: List[List[Any]]) -> Dict[str, np.ndarray]:
     return {
         "open_time": np.array([int(r[0]) for r in raw]),
-        "open": np.array([float(r[1]) for r in raw]),
-        "high": np.array([float(r[2]) for r in raw]),
-        "low": np.array([float(r[3]) for r in raw]),
-        "close": np.array([float(r[4]) for r in raw]),
-        "volume": np.array([float(r[5]) for r in raw]),
+        "open":      np.array([float(r[1]) for r in raw]),
+        "high":      np.array([float(r[2]) for r in raw]),
+        "low":       np.array([float(r[3]) for r in raw]),
+        "close":     np.array([float(r[4]) for r in raw]),
+        "volume":    np.array([float(r[5]) for r in raw]),
     }
 
 # -------------------------- CORE LOGIC --------------------------------
 
-def quantize_qty(qty: float, step: float) -> float:
-    if step <= 0:
-        return qty
-    return math.floor(qty / step) * step
-
 def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[str, np.ndarray]]) -> Optional[dict]:
     try:
-        one = req["1h"]; four = req["4h"]; fifteen = req["15m"]; five = req["5m"]
+        one = req["1h"]
+        four = req["4h"]
+        fifteen = req["15m"]
+        five = req["5m"]
 
-        close_1h = one["close"]; high_1h = one["high"]; low_1h = one["low"]; vol_1h = one["volume"]
-        if len(close_1h) < max(EMA_SLOW + 5, SWING_LOOKBACK + 5):
+        close_1h = one["close"]
+        high_1h  = one["high"]
+        low_1h   = one["low"]
+        vol_1h   = one["volume"]
+
+        need_len = max(EMA_SLOW + 5, SWING_LOOKBACK + 5)
+        if close_1h.size < need_len or four["close"].size < need_len:
             return None
 
-        # Trend
-        ema20_1h = ema(close_1h, EMA_FAST); ema200_1h = ema(close_1h, EMA_SLOW)
-        ema20_4h = ema(four["close"], EMA_FAST); ema200_4h = ema(four["close"], EMA_SLOW)
+        # Trends
+        ema20_1h = ema(close_1h, EMA_FAST)
+        ema200_1h = ema(close_1h, EMA_SLOW)
+        ema20_4h = ema(four["close"], EMA_FAST)
+        ema200_4h = ema(four["close"], EMA_SLOW)
+
         ema20_slope_1h = float(ema20_1h[-1] - ema20_1h[-4])
         ema20_slope_4h = float(ema20_4h[-1] - ema20_4h[-4])
-        trend_ok = (ema20_slope_1h > 0 and ema20_slope_4h > 0 and
-                    float(close_1h[-1]) > float(ema200_1h[-1]) and float(four["close"][-1]) > float(ema200_4h[-1]))
 
-        # ATR/swing
+        trend_ok = (
+            ema20_slope_1h > 0 and
+            ema20_slope_4h > 0 and
+            float(close_1h[-1]) > float(ema200_1h[-1]) and
+            float(four["close"][-1]) > float(ema200_4h[-1])
+        )
+
+        # ATR & swings (1h)
         atr_1h = atr(high_1h, low_1h, close_1h, ATR_LEN)
-        if float(atr_1h[-1]) <= 0:
+        if float(atr_1h[-1]) <= 0.0:
             return None
+
         hh20 = swing_high(high_1h, SWING_LOOKBACK)
         ll20 = swing_low(low_1h, SWING_LOOKBACK)
 
-        # Volume / Liquidity
+        # Volume and liquidity
         vz = vol_zscore(vol_1h, window=50)
-        avg_vol_usdc = float(np.mean(vol_1h[-10:]) * close_1h[-1])
+        avg_vol_usdc = float(np.mean(vol_1h[-10:]) * close_1h[-1]) if vol_1h.size >= 10 else 0.0
         if avg_vol_usdc < MIN_AVG_VOL:
             return None
 
-        # Proximity & momentum confirms
-        prox = (float(hh20[-1]) - float(close_1h[-1])) / max(1e-9, float(atr_1h[-1]))
-        atr_rising = float(atr_1h[-1]) > float(atr_1h[-2]) > float(atr_1h[-3])
+        # Proximity (in ATRs) – negative means already above HH20
+        prox = float((hh20[-1] - close_1h[-1]) / max(1e-9, atr_1h[-1]))
+        atr_rising = bool(atr_1h[-1] > atr_1h[-2] > atr_1h[-3])
 
+        # Lower TF momentum confirms
         def mom_ok(tf: Dict[str, np.ndarray]) -> bool:
-            c = tf["close"]; e20 = ema(c, EMA_FAST)
-            return len(e20) >= 5 and (float(c[-1]) > float(e20[-1])) and (float(e20[-1]) > float(e20[-3]))
-        lower_tf_ok = mom_ok(fifteen) and mom_ok(five)
+            c = tf["close"]
+            e20 = ema(c, EMA_FAST)
+            if e20.size < 5:
+                return False
+            return bool((c[-1] > e20[-1]) and (e20[-1] > e20[-3]))
 
-        # RS vs BTC
+        mom15 = mom_ok(fifteen)
+        mom5  = mom_ok(five)
+        lower_tf_ok = mom15 and mom5
+
+        # RS vs BTC (1h)
         rs_strength = 0.0
-        if len(btc_1h_close) == len(close_1h):
+        if btc_1h_close.size == close_1h.size:
             rs_series = close_1h / np.where(btc_1h_close != 0, btc_1h_close, 1e-9)
             rs_strength = pct_change(rs_series, n=10)
 
         last_close = float(close_1h[-1])
-        last_low = float(low_1h[-1])
-        last_atr = float(atr_1h[-1])
+        last_high  = float(high_1h[-1])
+        last_low   = float(low_1h[-1])
+        last_atr   = float(atr_1h[-1])
+        breakout_level = float(hh20[-1])
+        confirm_price = last_high if RELAX_B_HIGH else last_close
 
+        # Relaxed gates
+        trend_ok_relaxed = trend_ok or (RELAXED_SIGNALS and (lower_tf_ok or vz >= 0.5 or rs_strength > 0.1))
+
+        # Apply dynamic relax multipliers if RELAXED_SIGNALS
+        vz_pre  = VOL_Z_MIN_PRE * (0.8 if RELAXED_SIGNALS else 1.0)
+        vz_brk  = VOL_Z_MIN_BREAK * (0.75 if RELAXED_SIGNALS else 1.0)
+        prox_min = PROX_ATR_MIN - (0.2 if RELAXED_SIGNALS else 0.0)  # allow slightly more above HH20
+        prox_max = PROX_ATR_MAX + (0.3 if RELAXED_SIGNALS else 0.0)
+
+        # Confirmed breakout
+        within_runaway = (last_close <= breakout_level + ALLOW_RUNAWAY_ATR * last_atr)
+        confirmed_breakout = (
+            trend_ok_relaxed and
+            (confirm_price > (breakout_level + BREAK_BUFFER_ATR * last_atr)) and
+            (vz >= vz_brk) and
+            (lower_tf_ok or RELAXED_SIGNALS) and
+            within_runaway
+        )
+
+        # Pre-breakout / continuation
+        # allow prox negative (price just over HH20) if within prox_min (can be negative) and RELAXED_SIGNALS widens range
+        pre_breakout = (
+            trend_ok_relaxed and
+            (prox_min <= prox <= prox_max) and
+            (vz >= vz_pre) and
+            (atr_rising or RELAXED_SIGNALS)
+        )
+
+        # Levels and advisory size
+        entry = breakout_level + BREAK_BUFFER_ATR * last_atr
+        stop  = float(ll20[-1]) - 0.3 * last_atr  # small buffer under LL20
+        t1    = entry + 0.8 * last_atr
+        t2    = entry + 1.5 * last_atr
+
+        entry_to_stop = max(entry - stop, 1e-9)
+        position_size_usdc = (CAPITAL * RISK_PER_TRADE) / max(entry_to_stop / max(entry, 1e-9), 1e-9)
+        position_size = position_size_usdc / max(entry, 1e-9)
+
+        # Score (rankers)
         reasons: List[str] = []
         if trend_ok: reasons.append("TrendOK(1h&4h)")
         if atr_rising: reasons.append("ATR up")
@@ -312,53 +345,8 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
         if prox > 0: score += 1.0 / (min(max(prox, 0.01), 2.0))
         score += max(0.0, 5.0 * rs_strength)
         if lower_tf_ok: score += 0.5
-        score += math.log1p(max(0.0, avg_vol_usdc) / 1e5)
-
-        breakout_level = float(hh20[-1])
-        last_high = float(high_1h[-1])
-        confirm_price = last_high if RELAX_B_HIGH else last_close
-
-        # Thresholds (relaxed mode widens)
-        prox_min = PROX_ATR_MIN if not RELAXED_SIGNALS else min(-0.1, PROX_ATR_MIN)
-        prox_max = PROX_ATR_MAX if not RELAXED_SIGNALS else max(1.0, PROX_ATR_MAX)
-        vz_pre = VOL_Z_MIN_PRE if not RELAXED_SIGNALS else min(0.5, VOL_Z_MIN_PRE)
-        vz_break = VOL_Z_MIN_BREAK if not RELAXED_SIGNALS else min(0.7, VOL_Z_MIN_BREAK)
-
-        confirmed_breakout = (
-            (trend_ok or (RELAXED_SIGNALS and lower_tf_ok))
-            and confirm_price > (breakout_level + BREAK_BUFFER_ATR * last_atr)
-            and vz >= vz_break
-            and lower_tf_ok
-        )
-        pre_breakout = (
-            (trend_ok or (RELAXED_SIGNALS and lower_tf_ok))
-            and atr_rising
-            and prox_min <= prox <= prox_max
-            and vz >= vz_pre
-        )
-
-        # Levels
-        entry = breakout_level + BREAK_BUFFER_ATR * last_atr
-        base_stop = float(ll20[-1]) - 0.4 * last_atr  # a bit below LL20
-        natural_risk = max(entry - base_stop, entry * 0.005)  # floor 0.5%
-        stop = entry - natural_risk
-        t1 = entry + 0.8 * last_atr
-        t2 = entry + 1.5 * last_atr
-
-        # ---------- SIZE FEASIBILITY (minQty / minNotional) ----------
-        f = _SYMBOL_FILTERS.get(symbol) or {}
-        min_qty = float(f.get("min_qty", 0.0))
-        step_qty = float(f.get("step_qty", 0.0))
-        min_notional = float(f.get("min_notional", MIN_NOTIONAL_FALLBACK))
-
-        # advisory equity the scanner assumes
-        equity = max(ANALYSES_EQUITY_USDC, 0.0)
-        risk_dollars = equity * RISK_PER_TRADE
-        rpu = max(entry - stop, entry * 0.002)  # risk per unit
-        raw_qty = risk_dollars / rpu if rpu > 0 else 0.0
-        q_qty = quantize_qty(raw_qty, step_qty if step_qty > 0 else 1e-8)
-
-        too_small = (q_qty <= 0) or (q_qty < min_qty) or (entry * q_qty < max(MIN_NOTIONAL_FALLBACK, min_notional))
+        score += float(np.log1p(max(0.0, avg_vol_usdc) / 1e5))  # liquidity boost
+        if not trend_ok and trend_ok_relaxed: score += 0.2  # slight boost for relaxed trend gate
 
         out: Dict[str, Any] = {
             "symbol": symbol,
@@ -372,22 +360,15 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
             "t2": t2,
             "vol_z": vz,
             "prox_atr": prox,
-            "trend_ok": trend_ok,
-            "lower_tf_ok": lower_tf_ok,
+            "trend_ok": bool(trend_ok),
+            "lower_tf_ok": bool(lower_tf_ok),
             "rs10": rs_strength,
             "score": score,
             "reasons": reasons,
             "avg_vol": avg_vol_usdc,
-            "advisory_qty": q_qty,
-            "advisory_notional": entry * q_qty,
-            "min_qty": min_qty,
-            "min_notional": min_notional,
+            "position_size": position_size,
+            "position_size_usdc": position_size_usdc,
         }
-
-        if too_small:
-            out["signal"] = "N"
-            out.setdefault("reasons", []).append("TooSmall(min)")
-            return out
 
         if confirmed_breakout:
             out["signal"] = "B"
@@ -395,8 +376,16 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
             out["signal"] = "C"
         else:
             out["signal"] = "N"
+            miss = []
+            if not trend_ok_relaxed: miss.append("trend")
+            if vz < min(vz_pre, vz_brk): miss.append(f"low_vz={vz:.2f}")
+            if not (prox_min <= prox <= prox_max): miss.append(f"prox={prox:.2f}")
+            if not lower_tf_ok: miss.append("no_lowerTF")
+            if not within_runaway: miss.append("too_far_runaway")
+            out["miss_reasons"] = miss
 
         return out
+
     except Exception as e:
         logging.warning(f"Analysis failed for {symbol}: {e}")
         return None
@@ -408,65 +397,38 @@ def write_summary(payload: dict, dest_latest: Path) -> None:
 
 # -------------------------- PIPELINE ----------------------------------
 
+def build_universe() -> Tuple[Dict[str, str], List[str]]:
+    exch = fetch_exchange_usdc_symbols()
+    if not exch:
+        return {}, []
+    mapping: Dict[str, str] = {}
+    for sym, meta in exch.items():
+        base = meta.get("baseAsset", "").upper()
+        if not base:
+            continue
+        mapping[base] = sym
+    return mapping, []
+
 def compute_regime(btc_1h: Dict[str, np.ndarray], btc_4h: Dict[str, np.ndarray]) -> Tuple[bool, str]:
     try:
         ema200_4h = ema(btc_4h["close"], EMA_SLOW)
         ema20_4h = ema(btc_4h["close"], EMA_FAST)
         ema200_1h = ema(btc_1h["close"], EMA_SLOW)
         ema20_1h = ema(btc_1h["close"], EMA_FAST)
-        if len(ema200_4h) > 4 and len(ema200_1h) > 4:
+        if ema200_4h.size > 4 and ema200_1h.size > 4:
             slope4 = float(ema20_4h[-1] - ema20_4h[-4])
             slope1 = float(ema20_1h[-1] - ema20_1h[-4])
-            if (float(btc_4h["close"][-1]) > float(ema200_4h[-1]) and
-                float(btc_1h["close"][-1]) > float(ema200_1h[-1]) and
-                slope4 > 0 and slope1 > 0):
+            if (btc_4h["close"][-1] > ema200_4h[-1]) and (btc_1h["close"][-1] > ema200_1h[-1]) and slope4 > 0 and slope1 > 0:
                 return True, "BTC uptrend (4h & 1h)"
             return False, "BTC not in uptrend"
         return False, "insufficient data"
     except Exception:
         return False, "regime calc error"
 
-def run_pipeline(mode: str, ignore_regime: bool = False, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
-    # load symbol filters once
-    load_symbol_filters()
+def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Optional[int] = None) -> dict:
+    started = datetime.now(timezone.utc).astimezone(TZ) if end_time is None else datetime.fromtimestamp(end_time / 1000, timezone.utc).astimezone(TZ)
 
-    symbols_meta = fetch_exchange_usdc_symbols()
-    if not symbols_meta:
-        return {
-            "generated_at": human_time(),
-            "timezone": TZ_NAME,
-            "regime": {"ok": False, "reason": "exchangeInfo unavailable"},
-            "signals": {"type": "HOLD"},
-            "orders": [], "candidates": [],
-            "universe": {"scanned": 0, "eligible": 0, "skipped": {"no_data": [], "missing_binance": []}},
-            "meta": {"binance_endpoint": BASE_URL, "mode": mode},
-        }
-
-    symbols = list(symbols_meta.keys())
-
-    # Backtest path (daily end_time stepping)
-    if start_date and end_date:
-        start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
-        end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
-        current_dt = start_dt
-        results = []
-        while current_dt <= end_dt:
-            results.append(process_day(symbols, mode, ignore_regime, int(current_dt.timestamp() * 1000)))
-            current_dt += timedelta(days=1)
-        stats = {
-            "total_days": len(results),
-            "total_breakouts": sum(len(p.get("orders", [])) for p in results),
-            "avg_candidates": round(statistics.fmean(len(p.get("candidates", [])) for p in results), 3) if results else 0,
-        }
-        return {"backtest_results": results, "stats": stats}
-
-    # Live path
-    return process_day(symbols, mode, ignore_regime, None)
-
-def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Optional[int]) -> dict:
-    started = datetime.now(timezone.utc).astimezone(TZ) if not end_time else datetime.fromtimestamp(end_time / 1000, timezone.utc).astimezone(TZ)
-
-    # BTC baseline
+    # Baseline BTC
     btc_raw_1h = fetch_klines("BTCUSDC", INTERVALS["1h"][0], INTERVALS["1h"][1], end_time)
     btc_raw_4h = fetch_klines("BTCUSDC", INTERVALS["4h"][0], INTERVALS["4h"][1], end_time)
     if not btc_raw_1h or not btc_raw_4h:
@@ -475,60 +437,61 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
             "timezone": TZ_NAME,
             "regime": {"ok": False, "reason": "BTC data unavailable"},
             "signals": {"type": "HOLD"},
-            "orders": [], "candidates": [],
+            "orders": [],
+            "candidates": [],
             "universe": {"scanned": 0, "eligible": len(symbols), "skipped": {"no_data": [], "missing_binance": []}},
             "meta": {"binance_endpoint": BASE_URL, "mode": mode},
         }
-    btc_1h = parse_klines(btc_raw_1h); btc_4h = parse_klines(btc_raw_4h)
+
+    btc_1h = parse_klines(btc_raw_1h)
+    btc_4h = parse_klines(btc_raw_4h)
     regime_ok, regime_reason = compute_regime(btc_1h, btc_4h)
     if ignore_regime:
-        regime_ok, regime_reason = True, "Regime ignored by flag"
+        regime_ok = True
+        regime_reason = "Regime ignored by flag"
     btc_close_1h = btc_1h["close"]
 
-    # Thin for light modes
-    all_symbols = symbols[:]
+    # Thin symbols in light modes
     if mode == "light-fast":
-        random.shuffle(all_symbols); all_symbols = all_symbols[: len(all_symbols)//2]
+        random.shuffle(symbols); symbols = symbols[: max(1, len(symbols)//2)]
     elif mode == "light-hourly":
-        random.shuffle(all_symbols); all_symbols = all_symbols[: len(all_symbols)//3]
+        random.shuffle(symbols); symbols = symbols[: max(1, len(symbols)//3)]
 
-    # Fetch all TFs in parallel per TF
+    # Fetch all TFs in parallel
     reqs: Dict[str, Dict[str, Optional[Dict[str, np.ndarray]]]] = {}
     for tf, (interval, limit) in INTERVALS.items():
-        raw_all = fetch_all_klines(all_symbols, interval, limit, end_time)
-        reqs[tf] = {sym: (parse_klines(raw_all[sym]) if raw_all[sym] else None) for sym in all_symbols}
+        raw_all = fetch_all_klines(symbols, interval, limit, end_time)
+        reqs[tf] = {sym: (parse_klines(raw_all[sym]) if raw_all[sym] else None) for sym in symbols}
 
     candidates: List[dict] = []
     confirmed: List[dict] = []
-    no_data_syms: List[str] = []
+    no_data: List[str] = []
     all_infos: List[dict] = []
     scanned = 0
 
-    for sym in all_symbols:
+    for sym in symbols:
         scanned += 1
-        tf_pack = {tf: reqs[tf][sym] for tf in INTERVALS}
-        if any(d is None for d in tf_pack.values()):
-            no_data_syms.append(sym.split("USDC")[0])
+        tf_data = {tf: reqs[tf][sym] for tf in INTERVALS}
+        if any(v is None for v in tf_data.values()):
+            no_data.append(sym.split("USDC")[0])
             continue
-        info = analyze_symbol(sym, btc_close_1h, tf_pack)
+        info = analyze_symbol(sym, btc_close_1h, tf_data)  # type: ignore
         if not info:
-            no_data_syms.append(sym.split("USDC")[0])
+            no_data.append(sym.split("USDC")[0])
             continue
         info["ticker"] = sym.split("USDC")[0]
+        info["rotation_exempt"] = False
         all_infos.append(info)
         if info["signal"] == "B":
             confirmed.append(info)
         elif info["signal"] == "C":
             candidates.append(info)
 
-    # Near-miss logging
-    non_signals = sorted([i for i in all_infos if i.get("signal") == "N"],
-                         key=lambda x: x.get("score", 0.0), reverse=True)
-    for i in range(min(NEAR_MISS_LOG_COUNT, len(non_signals))):
-        ns = non_signals[i]
-        logging.info(f"Near-miss {ns['symbol']}: score={ns.get('score',0):.2f}, "
-                     f"vz={ns.get('vol_z',0):.2f}, prox={ns.get('prox_atr',0):.2f}, "
-                     f"reasons={ns.get('reasons',[])}")
+    # Near-miss logging (top N non-signals)
+    non_signals = [i for i in all_infos if i.get("signal") == "N"]
+    non_signals.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    for ns in non_signals[:NEAR_MISS_LOG_COUNT]:
+        logging.info(f"Near-miss {ns['symbol']}: score={ns['score']:.2f}, vz={ns['vol_z']:.2f}, prox={ns['prox_atr']:.2f}, miss={ns.get('miss_reasons', [])}")
 
     if not regime_ok:
         return {
@@ -536,13 +499,12 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
             "timezone": TZ_NAME,
             "regime": {"ok": regime_ok, "reason": regime_reason},
             "signals": {"type": "HOLD"},
-            "orders": [], "candidates": [],
-            "universe": {"scanned": scanned, "eligible": len(all_symbols),
-                         "skipped": {"no_data": sorted(no_data_syms), "missing_binance": []}},
+            "orders": [],
+            "candidates": [],
+            "universe": {"scanned": scanned, "eligible": len(symbols), "skipped": {"no_data": sorted(no_data), "missing_binance": []}},
             "meta": {"binance_endpoint": BASE_URL, "mode": mode},
         }
 
-    # Rank & payloads
     candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     top_candidates = candidates[:MAX_CANDIDATES]
 
@@ -552,38 +514,40 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
         signal_type = "B"
         for o in confirmed:
             orders.append({
-                "ticker": o["ticker"], "symbol": o["symbol"],
-                "entry": round(float(o["entry"]), 8),
-                "stop": round(float(o["stop"]), 8),
-                "t1": round(float(o["t1"]), 8),
-                "t2": round(float(o["t2"]), 8),
-                "atr": round(float(o["atr"]), 8),
+                "ticker": o["ticker"],
+                "symbol": o["symbol"],
+                "entry": round(o["entry"], 8),
+                "stop": round(o["stop"], 8),
+                "t1": round(o["t1"], 8),
+                "t2": round(o["t2"], 8),
+                "atr": round(o["atr"], 8),
                 "tf": "1h",
                 "notes": o.get("reasons", []),
                 "rotation_exempt": False,
-                "advisory_qty": round(float(o.get("advisory_qty", 0.0)), 8),
-                "advisory_notional": round(float(o.get("advisory_notional", 0.0)), 8),
+                "position_size": round(o["position_size"], 8),
+                "position_size_usdc": round(o["position_size_usdc"], 2),
             })
     elif top_candidates:
         signal_type = "C"
 
     cand_payload = [{
-        "ticker": c["ticker"], "symbol": c["symbol"],
-        "last": round(float(c["last"]), 8),
-        "atr": round(float(c["atr"]), 8),
-        "entry": round(float(c["entry"]), 8),
-        "stop": round(float(c["stop"]), 8),
-        "t1": round(float(c["t1"]), 8),
-        "t2": round(float(c["t2"]), 8),
-        "score": round(float(c["score"]), 4),
-        "vol_z": round(float(c["vol_z"]), 2),
-        "prox_atr": round(float(c["prox_atr"]), 3),
-        "rs10": round(float(c["rs10"]), 4),
+        "ticker": c["ticker"],
+        "symbol": c["symbol"],
+        "last": round(c["last"], 8),
+        "atr": round(c["atr"], 8),
+        "entry": round(c["entry"], 8),
+        "stop": round(c["stop"], 8),
+        "t1": round(c["t1"], 8),
+        "t2": round(c["t2"], 8),
+        "score": round(c["score"], 4),
+        "vol_z": round(c["vol_z"], 2),
+        "prox_atr": round(c["prox_atr"], 3),
+        "rs10": round(c["rs10"], 4),
         "tf": "1h",
         "notes": c.get("reasons", []),
         "rotation_exempt": False,
-        "advisory_qty": round(float(c.get("advisory_qty", 0.0)), 8),
-        "advisory_notional": round(float(c.get("advisory_notional", 0.0)), 8),
+        "position_size": round(c["position_size"], 8),
+        "position_size_usdc": round(c["position_size_usdc"], 2),
     } for c in top_candidates]
 
     payload: Dict[str, Any] = {
@@ -595,8 +559,11 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
         "candidates": cand_payload,
         "universe": {
             "scanned": scanned,
-            "eligible": len(all_symbols),
-            "skipped": {"no_data": sorted(no_data_syms), "missing_binance": []},
+            "eligible": len(symbols),
+            "skipped": {
+                "no_data": sorted(no_data),
+                "missing_binance": [],  # always empty by design
+            },
         },
         "meta": {
             "params": {
@@ -605,11 +572,11 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
                 "PROX_ATR_MIN": PROX_ATR_MIN, "PROX_ATR_MAX": PROX_ATR_MAX,
                 "VOL_Z_MIN_PRE": VOL_Z_MIN_PRE, "VOL_Z_MIN_BREAK": VOL_Z_MIN_BREAK,
                 "BREAK_BUFFER_ATR": BREAK_BUFFER_ATR,
+                "ALLOW_RUNAWAY_ATR": ALLOW_RUNAWAY_ATR,
                 "MAX_CANDIDATES": MAX_CANDIDATES,
                 "MIN_AVG_VOL": MIN_AVG_VOL,
-                "CAPITAL": CAPITAL, "RISK_PER_TRADE": RISK_PER_TRADE,
-                "ANALYSES_EQUITY_USDC": ANALYSES_EQUITY_USDC,
-                "MIN_NOTIONAL_FALLBACK": MIN_NOTIONAL_FALLBACK,
+                "CAPITAL": CAPITAL,
+                "RISK_PER_TRADE": RISK_PER_TRADE,
                 "RELAXED_SIGNALS": RELAXED_SIGNALS,
             },
             "lower_tf_confirm": True,
@@ -620,25 +587,63 @@ def process_day(symbols: List[str], mode: str, ignore_regime: bool, end_time: Op
     }
     return payload
 
+def run_pipeline(mode: str, ignore_regime: bool = False,
+                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
+    # Backtest mode (optional)
+    if start_date and end_date:
+        start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+        cur = start_dt
+        results = []
+        while cur <= end_dt:
+            end_ms = int(cur.timestamp() * 1000)
+            mapping, _ = build_universe()
+            symbols = list(mapping.values())
+            results.append(process(symbols, mode, ignore_regime, end_ms))
+            cur += timedelta(days=1)
+        stats = {
+            "total_days": len(results),
+            "total_breakouts": sum(len(p.get("orders", [])) for p in results),
+            "avg_candidates": (sum(len(p.get("candidates", [])) for p in results) / max(1, len(results))),
+        }
+        return {"backtest_results": results, "stats": stats}
+
+    # Live mode
+    mapping, _ = build_universe()
+    if not mapping:
+        return {
+            "generated_at": human_time(),
+            "timezone": TZ_NAME,
+            "regime": {"ok": False, "reason": "exchangeInfo unavailable or no eligible symbols"},
+            "signals": {"type": "HOLD"},
+            "orders": [],
+            "candidates": [],
+            "universe": {"scanned": 0, "eligible": 0, "skipped": {"no_data": [], "missing_binance": []}},
+            "meta": {"binance_endpoint": BASE_URL, "mode": mode},
+        }
+    symbols = list(mapping.values())
+    return process(symbols, mode, ignore_regime)
+
 # ------------------------------ CLI -----------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Analyses pipeline (USDC)")
-    p.add_argument("--mode", default="deep", choices=["deep", "light-fast", "light-hourly"])
-    p.add_argument("--ignore_regime", action="store_true")
-    p.add_argument("--backtest", action="store_true")
-    p.add_argument("--start_date", type=str)
-    p.add_argument("--end_date", type=str)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Analyses pipeline (USDC)")
+    parser.add_argument("--mode", default="deep", choices=["deep", "light-fast", "light-hourly"])
+    parser.add_argument("--ignore_regime", action="store_true", help="Ignore BTC regime check")
+    parser.add_argument("--backtest", action="store_true", help="Run in backtest mode")
+    parser.add_argument("--start_date", type=str, help="Start date for backtest (YYYY-MM-DD)")
+    parser.add_argument("--end_date", type=str, help="End date for backtest (YYYY-MM-DD)")
+    args = parser.parse_args()
 
     if args.backtest and (not args.start_date or not args.end_date):
         logging.error("Backtest requires --start_date and --end_date")
         return
 
     try:
-        payload = (run_pipeline(args.mode, args.ignore_regime, args.start_date, args.end_date)
-                   if args.backtest else
-                   run_pipeline(args.mode, args.ignore_regime))
+        if args.backtest:
+            payload = run_pipeline(args.mode, args.ignore_regime, args.start_date, args.end_date)
+        else:
+            payload = run_pipeline(args.mode, args.ignore_regime)
     except Exception:
         logging.error("UNCAUGHT ERROR:\n" + traceback.format_exc())
         payload = {
@@ -646,21 +651,23 @@ def main() -> None:
             "timezone": TZ_NAME,
             "regime": {"ok": False, "reason": "uncaught error"},
             "signals": {"type": "HOLD"},
-            "orders": [], "candidates": [],
+            "orders": [],
+            "candidates": [],
             "universe": {"scanned": 0, "eligible": 0, "skipped": {"no_data": [], "missing_binance": []}},
             "meta": {"binance_endpoint": BASE_URL, "mode": args.mode},
         }
 
     latest_path = Path("public_runs/latest/summary.json")
     write_summary(payload, latest_path)
+
     stamp = datetime.now(timezone.utc).astimezone(TZ).strftime("%Y%m%d_%H%M%S")
-    snap = Path("public_runs") / stamp
-    ensure_dirs(snap / "summary.json")
-    with (snap / "summary.json").open("w", encoding="utf-8") as f:
+    snapshot_dir = Path("public_runs") / stamp
+    ensure_dirs(snapshot_dir / "summary.json")
+    with (snapshot_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=False)
 
-    logging.info(f"Summary written to {latest_path} (signal={payload.get('signals',{}).get('type')}, "
-                 f"regime_ok={payload.get('regime',{}).get('ok')})")
+    logging.info(f"Summary written to {latest_path} "
+                 f"(signal={payload.get('signals',{}).get('type')}, regime_ok={payload.get('regime',{}).get('ok')})")
 
 if __name__ == "__main__":
     main()
