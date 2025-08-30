@@ -19,7 +19,7 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: "1"
-  BINANCE_BASE_URL: https://data-api.binance.vision
+  BINANCE_BASE_URL: "https://data-api.binance.vision"
 
   # Relaxed defaults for quiet markets (override via dispatch/env as needed)
   RELAXED_SIGNALS: "1"
@@ -72,7 +72,7 @@ jobs:
           if [ -n "${IGN_INPUT}" ]; then IGN="${IGN_INPUT}"; fi
           ARGS="--mode deep"
           if [ "${IGN}" = "1" ]; then ARGS="$ARGS --ignore_regime"; fi
-          echo "Running analyses with ARGS: $ARGS"
+          echo "[analyses] ARGS: $ARGS"
           python -m scripts.analyses $ARGS
           test -s public_runs/latest/summary.json
           python - <<'PY'
@@ -85,86 +85,7 @@ jobs:
                 "| eligible:", uni.get("eligible"),
                 "| cands:", len(p.get("candidates",[])),
                 "| orders:", len(p.get("orders",[])))
+          # safe: only prints if present
           if p.get("meta",{}).get("near_misses"):
               print("Near-misses:", p["meta"]["near_misses"])
           PY
-
-      # ---------- EXECUTE BEFORE ANY GIT OPS ----------
-      - name: Run exec bot on fresh local summary
-        env:
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "0"
-          FORCE_EQUITY_USD: "0"
-          QUOTE_ASSET: "USDC"
-          TRADE_CANDIDATES: "1"
-          C_RISK_MULT: "0.7"
-          STOP_LIMIT_OFFSET: "0.002"
-          SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
-        run: |
-          set -euo pipefail
-          if grep -qE '^(<<<<<<<|=======|>>>>>>>)' public_runs/latest/summary.json; then
-            echo "ERROR: summary.json has merge markers. Aborting exec."
-            sed -n '1,120p' public_runs/latest/summary.json || true
-            exit 1
-          fi
-          python exec_bot.py
-
-      # ---------- COMMIT SCAN ARTIFACTS ----------
-      - name: Commit public_runs
-        run: |
-          set -euo pipefail
-          git config --global safe.directory "$GITHUB_WORKSPACE"
-          git config user.name  "bincrypare-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git config --global pull.rebase false
-
-          git add public_runs
-          if git diff --cached --quiet; then
-            echo "No public_runs changes."
-          else
-            git commit -m "scan: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          fi
-
-          git fetch origin main || true
-          git merge -X ours --no-edit origin/main || true
-          if [ -e .git/MERGE_HEAD ]; then
-            git checkout --ours public_runs/latest/summary.json || true
-            git add public_runs/latest/summary.json || true
-            git commit -m "merge(resolved with -X ours for summary): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
-          fi
-          git push origin HEAD:main || true
-
-      # ---------- COMMIT STATE ONLY ----------
-      - name: Persist state
-        run: |
-          set -euo pipefail
-          git config --global safe.directory "$GITHUB_WORKSPACE"
-          git config user.name  "bincrypare-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git config --global pull.rebase false
-
-          if [ -f state/open_positions.json ]; then
-            if grep -qE '^(<<<<<<<|=======|>>>>>>>)' state/open_positions.json; then
-              echo "Conflict in state file; using ours."
-              git checkout --ours state/open_positions.json || true
-            fi
-
-            git add state/open_positions.json
-            if git diff --cached --quiet; then
-              echo "No state changes."
-            else
-              git commit -m "state: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            fi
-
-            git fetch origin main || true
-            git merge -X ours --no-edit origin/main || true
-            if [ -e .git/MERGE_HEAD ]; then
-              git checkout --ours state/open_positions.json || true
-              git add state/open_positions.json || true
-              git commit -m "merge(state resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
-            fi
-            git push origin HEAD:main || true
-          else
-            echo "No state file to persist."
-          fi
