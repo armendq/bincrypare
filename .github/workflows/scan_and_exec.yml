@@ -2,8 +2,8 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/4 * * * *"       # primary: every 4 minutes
-    - cron: "2-59/4 * * * *"    # backup: same cadence, +2 min offset
+    - cron: "*/4 * * * *"        # primary: every 4 minutes
+    - cron: "2-59/4 * * * *"     # backup: same cadence offset by +2 min
   workflow_dispatch:
     inputs:
       ignore_regime:
@@ -16,17 +16,17 @@ permissions:
 
 concurrency:
   group: scan-and-exec-${{ github.ref }}
-  cancel-in-progress: true       # avoid overlapping when backup fires
+  cancel-in-progress: true        # if backup fires, cancel any still-running job
 
 env:
   PYTHONUNBUFFERED: "1"
   BINANCE_BASE_URL: https://data-api.binance.vision
 
-  # ---------- Analyses defaults (tighter, but relaxed path enabled) ----------
+  # ---------- Analyses defaults (moderately strict, relaxed paths enabled) ----------
   RELAXED_SIGNALS: "1"
   REQUIRE_LOWER_TF_OK: "1"
-  IGNORE_REGIME: "1"             # can be overridden by dispatch input
-  RELAX_B_HIGH: "0"              # confirm break with close (not just high)
+  IGNORE_REGIME: "1"              # can be overridden by dispatch input
+  RELAX_B_HIGH: "0"               # confirm break with close (not high)
   BREAK_BUFFER_ATR: "0.03"
   VOL_Z_MIN_PRE: "0.8"
   VOL_Z_MIN_BREAK: "1.0"
@@ -41,29 +41,17 @@ env:
   NEAR_MISS_LOG_COUNT: "5"
 
   # ---------- Exec-bot defaults (risk & protection) ----------
-  # live trading + $400 sizing cap
-  DRY_RUN: "0"
-  FORCE_EQUITY_USD: "400"
-  QUOTE_ASSET: "USDC"
-  RISK_PCT: "0.012"              # 1.2% risk per position baseline
-
-  # candidates
-  TRADE_CANDIDATES: "1"
-  C_RISK_MULT: "0.5"             # half-risk for candidates
-
-  # order/precision helpers
+  # Target: ~$50 risk per trade on ~$400 equity -> RISK_PCT = 0.125
+  RISK_PCT: "0.125"
   ALLOW_MIN_ORDER: "1"
   MIN_ORDER_USD: "6"
-  STOP_LIMIT_OFFSET: "0.002"     # +0.2% above entry for stop-limit BUY
-  PRICE_SLIPPAGE: "0.002"        # 0.2% cushion on virtual stop activations
-
-  # portfolio/ops guards
   MAX_OPEN_POSITIONS: "2"
-  PROMOTE_PENDING_AFTER_MIN: "8"   # pending promoted to market after 8m if through price
-  CANCEL_STALE_PENDING_MIN: "45"   # cancel pendings after 45m
-  CUT_LOSS_MIN: "60"               # cut losers after 60m if underwater
-  CUT_LOSS_PCT: "0.01"             # -1% vs entry triggers the time-based cut
-  BE_PROFIT_ATR: "0.8"             # move to breakeven (virtual) after +0.8 ATR
+  PRICE_SLIPPAGE: "0.002"
+  STOP_LIMIT_OFFSET: "0.002"
+  PROMOTE_PENDING_AFTER_MIN: "8"
+  CANCEL_STALE_PENDING_MIN: "45"
+  CUT_LOSS_MIN: "60"
+  BE_PROFIT_ATR: "0.8"
 
 jobs:
   run:
@@ -96,10 +84,13 @@ jobs:
           IGN_INPUT="${{ github.event.inputs.ignore_regime || '' }}"
           IGN="${IGNORE_REGIME}"
           if [ -n "${IGN_INPUT}" ]; then IGN="${IGN_INPUT}"; fi
+
           ARGS="--mode deep"
           if [ "${IGN}" = "1" ]; then ARGS="$ARGS --ignore_regime"; fi
+
           echo "Running analyses with ARGS: $ARGS"
           python -m scripts.analyses $ARGS
+
           test -s public_runs/latest/summary.json
           python - <<'PY'
           import json
@@ -121,12 +112,18 @@ jobs:
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          DRY_RUN: "0"                                 # live
+          FORCE_EQUITY_USD: "0"                        # use live USDC balance
+          QUOTE_ASSET: "USDC"
+          TRADE_CANDIDATES: "1"                        # stop-limit entries for C
+          C_RISK_MULT: "0.4"                           # candidates risk on 40% of equity
           SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
         run: |
           set -euo pipefail
+          # safety: abort if merge markers somehow present in summary
           if grep -qE '^(<<<<<<<|=======|>>>>>>>)' public_runs/latest/summary.json; then
             echo "ERROR: summary.json has merge markers. Aborting exec."
-            sed -n '1,160p' public_runs/latest/summary.json || true
+            sed -n '1,120p' public_runs/latest/summary.json || true
             exit 1
           fi
           python exec_bot.py
