@@ -1,5 +1,5 @@
 {
-  "_last_run": "2025-08-30 17:58:26",
+  "_last_run": "2025-08-30 18:06:14",
   "_last_balance": {
     "asset": "USDC",
     "free": 3.00042386,
@@ -40,7 +40,12 @@
     "entry_order_id": 114230521,
     "type": "C",
     "tps_placed": false,
-    "activated_at": 1756576708.642157
+    "activated_at": 1756576708.642157,
+    "min_qty": 0.01,
+    "step_qty": 0.01,
+    "tick": 0.001,
+    "min_notional": 5.0,
+    "ts": 1756577174.847288
   },
   "NOTUSDC": {
     "entry": 0.00180135,
@@ -53,7 +58,12 @@
     "entry_order_id": 192194354,
     "type": "C",
     "tps_placed": false,
-    "activated_at": 1756576710.132996
+    "activated_at": 1756576710.132996,
+    "min_qty": 1.0,
+    "step_qty": 1.0,
+    "tick": 1e-06,
+    "min_notional": 5.0,
+    "ts": 1756577175.672117
   },
   "1000SATSUSDC": {
     "entry": 3.714e-05,
@@ -65,7 +75,12 @@
     "status": "pending",
     "entry_order_id": 75603497,
     "type": "C",
-    "tps_placed": false
+    "tps_placed": false,
+    "min_qty": 1.0,
+    "step_qty": 1.0,
+    "tick": 1e-08,
+    "min_notional": 5.0,
+    "ts": 1756577176.868142
   },
   "1MBABYDOGEUSDC": {
     "entry": 0.00120557,
@@ -80,6 +95,8 @@
     "status": "pending",
     "entry_order_id": 66281454,
     "type": "C",
-    "created_at": 1756567533.202124
+    "created_at": 1756567533.202124,
+    "min_notional": 5.0,
+    "ts": 1756577177.657154
   }
 }
