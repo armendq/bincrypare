@@ -2,7 +2,7 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/4 * * * *"
+    - cron: "*/4 * * * *"      # every 4 minutes
   workflow_dispatch:
     inputs:
       ignore_regime:
@@ -19,32 +19,36 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: "1"
-  BINANCE_BASE_URL: "https://data-api.binance.vision"
+  BINANCE_BASE_URL: https://data-api.binance.vision
 
-  # Scanner knobs
-  RELAXED_SIGNALS: "1"
-  IGNORE_REGIME: "1"
-  RELAX_B_HIGH: "0"
-  BREAK_BUFFER_ATR: "0.02"
-  VOL_Z_MIN_BREAK: "0.7"
-  VOL_Z_MIN_PRE: "0.5"
+  # ---------- Analyses defaults (tighter for cleaner signals) ----------
+  RELAXED_SIGNALS: "1"          # still allow relaxed paths, but with stricter gates below
+  REQUIRE_LOWER_TF_OK: "1"      # 15m+5m momentum must confirm
+  IGNORE_REGIME: "1"            # can be overridden by dispatch input
+  RELAX_B_HIGH: "0"             # confirm break with close, not just high
+  BREAK_BUFFER_ATR: "0.03"
+  VOL_Z_MIN_PRE: "0.8"
+  VOL_Z_MIN_BREAK: "1.0"
   PROX_ATR_MIN: "0.00"
-  PROX_ATR_MAX: "1.0"
-  MIN_AVG_VOL: "1000"
-  STOP_ATR_BUFFER: "0.4"
+  PROX_ATR_MAX: "0.60"
+  MIN_AVG_VOL: "1500"
+  STOP_ATR_BUFFER: "0.40"
   MIN_RISK_FLOOR_PCT: "0.008"
   MAX_RISK_CAP_PCT: "0.05"
   MAX_WORKERS: "12"
   LOG_LEVEL: "INFO"
+  NEAR_MISS_LOG_COUNT: "5"
 
-  # Executor knobs
-  ALLOW_MIN_ORDER: "1"
-  MIN_ORDER_USD: "10"
-  PENDING_TTL_H: "3"
-  EARLY_CANCEL_R: "0.5"
-  LIVE_TTL_H: "36"
-  STALE_CHECK_H: "8"
-  STALE_MIN_MFE_R: "0.3"
+  # ---------- Exec-bot defaults (risk & protection) ----------
+  ALLOW_MIN_ORDER: "1"          # fall back to TP-limit + virtual stop if OCO notional fails
+  MIN_ORDER_USD:  "6"           # at least $6 notional when falling back
+  MAX_OPEN_POSITIONS: "2"       # cap simultaneous live positions
+  PRICE_SLIPPAGE: "0.002"       # 0.2% early trigger for virtual stop/activation
+  STOP_LIMIT_OFFSET: "0.002"    # 0.2% cushion for stop-limit orders
+  PROMOTE_PENDING_AFTER_MIN: "8"   # if stop-limit would trigger immediately, promote to market buy after X min
+  CANCEL_STALE_PENDING_MIN: "45"   # pending too long -> cancel
+  CUT_LOSS_MIN: "60"               # live for 60m without progress -> cut
+  BE_PROFIT_ATR: "0.8"             # move to breakeven after +0.8 ATR in favor
 
 jobs:
   run:
@@ -79,7 +83,7 @@ jobs:
           if [ -n "${IGN_INPUT}" ]; then IGN="${IGN_INPUT}"; fi
           ARGS="--mode deep"
           if [ "${IGN}" = "1" ]; then ARGS="$ARGS --ignore_regime"; fi
-          echo "[analyses] ARGS: $ARGS"
+          echo "Running analyses with ARGS: $ARGS"
           python -m scripts.analyses $ARGS
           test -s public_runs/latest/summary.json
           python - <<'PY'
@@ -92,8 +96,9 @@ jobs:
                 "| eligible:", uni.get("eligible"),
                 "| cands:", len(p.get("candidates",[])),
                 "| orders:", len(p.get("orders",[])))
-          if p.get("meta",{}).get("near_misses"):
-              print("Near-misses:", p["meta"]["near_misses"])
+          nm = p.get("meta",{}).get("near_misses")
+          if nm:
+              print("Near-misses (top):", nm)
           PY
 
       # ---------- EXECUTE BEFORE ANY GIT OPS ----------
@@ -105,8 +110,7 @@ jobs:
           FORCE_EQUITY_USD: "0"
           QUOTE_ASSET: "USDC"
           TRADE_CANDIDATES: "1"
-          C_RISK_MULT: "0.7"
-          STOP_LIMIT_OFFSET: "0.002"
+          C_RISK_MULT: "0.4"
           SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
         run: |
           set -euo pipefail
@@ -135,11 +139,13 @@ jobs:
 
           git fetch origin main || true
           git merge -X ours --no-edit origin/main || true
+
           if [ -e .git/MERGE_HEAD ]; then
             git checkout --ours public_runs/latest/summary.json || true
             git add public_runs/latest/summary.json || true
             git commit -m "merge(resolved with -X ours for summary): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
           fi
+
           git push origin HEAD:main || true
 
       # ---------- COMMIT STATE ONLY ----------
@@ -171,6 +177,7 @@ jobs:
               git add state/open_positions.json || true
               git commit -m "merge(state resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
             fi
+
             git push origin HEAD:main || true
           else
             echo "No state file to persist."
