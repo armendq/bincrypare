@@ -2,8 +2,8 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/4 * * * *"      # every 4 minutes (UTC)
-    - cron: "2-59/4 * * * *"   # offset by 2 minutes to cover missed ticks
+    - cron: "*/4 * * * *"       # primary: every 4 minutes
+    - cron: "2-59/4 * * * *"    # backup: same cadence, +2 min offset
   workflow_dispatch:
     inputs:
       ignore_regime:
@@ -16,32 +16,40 @@ permissions:
 
 concurrency:
   group: scan-and-exec-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true       # avoid overlapping when backup fires
 
 env:
   PYTHONUNBUFFERED: "1"
   BINANCE_BASE_URL: https://data-api.binance.vision
 
-  # ---- Analyses tuning (relaxed defaults for quiet markets) ----
+  # ---------- Analyses defaults (tighter for cleaner signals) ----------
   RELAXED_SIGNALS: "1"
-  IGNORE_REGIME: "1"              # default; can be overridden by dispatch input
-  RELAX_B_HIGH: "0"               # confirm with close (not 1h high)
-  BREAK_BUFFER_ATR: "0.02"
-  VOL_Z_MIN_BREAK: "0.7"
-  VOL_Z_MIN_PRE: "0.5"
+  REQUIRE_LOWER_TF_OK: "1"
+  IGNORE_REGIME: "1"             # can be overridden by dispatch input
+  RELAX_B_HIGH: "0"
+  BREAK_BUFFER_ATR: "0.03"
+  VOL_Z_MIN_PRE: "0.8"
+  VOL_Z_MIN_BREAK: "1.0"
   PROX_ATR_MIN: "0.00"
-  PROX_ATR_MAX: "1.0"
-  MIN_AVG_VOL: "1000"
-  STOP_ATR_BUFFER: "0.4"
+  PROX_ATR_MAX: "0.60"
+  MIN_AVG_VOL: "1500"
+  STOP_ATR_BUFFER: "0.40"
   MIN_RISK_FLOOR_PCT: "0.008"
   MAX_RISK_CAP_PCT: "0.05"
   MAX_WORKERS: "12"
   LOG_LEVEL: "INFO"
   NEAR_MISS_LOG_COUNT: "5"
 
-  # Exec safeguards for small equity
-  ALLOW_MIN_ORDER: "1"            # enable tiny filler orders if below exchange min
-  MIN_ORDER_USD:  "6"             # use >= exchange min notional
+  # ---------- Exec-bot defaults (risk & protection) ----------
+  ALLOW_MIN_ORDER: "1"
+  MIN_ORDER_USD: "6"
+  MAX_OPEN_POSITIONS: "2"
+  PRICE_SLIPPAGE: "0.002"
+  STOP_LIMIT_OFFSET: "0.002"
+  PROMOTE_PENDING_AFTER_MIN: "8"
+  CANCEL_STALE_PENDING_MIN: "45"
+  CUT_LOSS_MIN: "60"
+  BE_PROFIT_ATR: "0.8"
 
 jobs:
   run:
@@ -62,12 +70,12 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests numpy python-binance
+          pip install requests python-binance numpy
 
       - name: Ensure output dirs
         run: mkdir -p public_runs/latest state
 
-      # ---------------- ANALYSES ----------------
+      # ---------- ANALYSES ----------
       - name: Run analyses (deep, USDC)
         run: |
           set -euo pipefail
@@ -83,36 +91,28 @@ jobs:
           import json
           p=json.load(open('public_runs/latest/summary.json'))
           uni=p.get("universe",{})
-          mm=p.get("meta",{})
           print("signals:", p.get("signals"),
                 "| regime:", p.get("regime"),
                 "| scanned:", uni.get("scanned"),
                 "| eligible:", uni.get("eligible"),
                 "| cands:", len(p.get("candidates",[])),
                 "| orders:", len(p.get("orders",[])))
-          for nm in (mm.get("near_misses") or [])[:5]:
-              print("near-miss:", nm)
+          nm = p.get("meta",{}).get("near_misses")
+          if nm:
+              print("Near-misses (top):", nm)
           PY
 
-      # ------------- EXECUTE BEFORE ANY GIT OPS -------------
+      # ---------- EXECUTE BEFORE ANY GIT OPS ----------
       - name: Run exec bot on fresh local summary
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "0"                 # 1=dry, 0=live
-          FORCE_EQUITY_USD: "0"        # use live USDC
+          DRY_RUN: "0"
+          FORCE_EQUITY_USD: "0"
           QUOTE_ASSET: "USDC"
-          TRADE_CANDIDATES: "1"        # trade C via stop-limit
-          C_RISK_MULT: "0.7"           # candidates at 70% risk
-          STOP_LIMIT_OFFSET: "0.002"   # +0.2% above entry
+          TRADE_CANDIDATES: "1"
+          C_RISK_MULT: "0.4"
           SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
-
-          # Exit / maintenance controls (used by exec_bot)
-          MAX_OPEN_MINUTES: "720"      # 12h hard exit
-          BREAKEVEN_AFTER_R: "1.0"     # move SL to BE after +1R
-          TIGHTEN_AFTER_R: "1.5"       # tighten SL trail after +1.5R
-          DAILY_CUTOFF_UTC: "23:50"    # cancel unfilled stop-limits near EOD
-          CANCEL_STALE_MIN: "180"      # cancel pending > 3h
         run: |
           set -euo pipefail
           if grep -qE '^(<<<<<<<|=======|>>>>>>>)' public_runs/latest/summary.json; then
@@ -122,7 +122,7 @@ jobs:
           fi
           python exec_bot.py
 
-      # ---------------- COMMIT SCAN ARTIFACTS ----------------
+      # ---------- COMMIT SCAN ARTIFACTS ----------
       - name: Commit public_runs
         run: |
           set -euo pipefail
@@ -147,7 +147,7 @@ jobs:
           fi
           git push origin HEAD:main || true
 
-      # ---------------- COMMIT STATE ONLY ----------------
+      # ---------- COMMIT STATE ONLY ----------
       - name: Persist state
         run: |
           set -euo pipefail
@@ -176,6 +176,7 @@ jobs:
               git add state/open_positions.json || true
               git commit -m "merge(state resolved with -X ours): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
             fi
+
             git push origin HEAD:main || true
           else
             echo "No state file to persist."
