@@ -1,9 +1,9 @@
 {
-  "_last_run": "2025-08-30 13:39:41",
+  "_last_run": "2025-08-30 13:43:26",
   "_last_balance": {
     "asset": "USDC",
-    "free": 22.79161776,
-    "locked": 5.75856,
+    "free": 12.25284976,
+    "locked": 16.297328,
     "total": 28.55017776
   },
   "PHAUSDC": {
@@ -50,6 +50,18 @@
     "t1_filled_qty": 0.0,
     "status": "pending",
     "entry_order_id": 192194354,
+    "type": "C",
+    "tps_placed": false
+  },
+  "1000SATSUSDC": {
+    "entry": 3.714e-05,
+    "stop": 3.529e-05,
+    "t1": 3.743e-05,
+    "t2": 3.769e-05,
+    "filled_qty": 0.0,
+    "t1_filled_qty": 0.0,
+    "status": "pending",
+    "entry_order_id": 75603497,
     "type": "C",
     "tps_placed": false
   }
