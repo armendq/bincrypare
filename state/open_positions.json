@@ -1,9 +1,31 @@
 {
-  "_last_run": "2025-08-30 05:47:09",
+  "_last_run": "2025-08-30 05:52:44",
   "_last_balance": {
     "asset": "USDC",
     "free": 34.30657776,
     "locked": 0.0,
     "total": 34.30657776
+  },
+  "PHAUSDC": {
+    "entry": 0.1105304,
+    "stop": 0.10500388,
+    "t1": 0.11174636,
+    "t2": 0.11281033,
+    "filled_qty": 0.0,
+    "t1_filled_qty": 0.0,
+    "status": "pending",
+    "entry_order_id": 21527974,
+    "type": "C"
+  },
+  "GMTUSDC": {
+    "entry": 0.0432127,
+    "stop": 0.04105207,
+    "t1": 0.04372089,
+    "t2": 0.04416556,
+    "filled_qty": 0.0,
+    "t1_filled_qty": 0.0,
+    "status": "pending",
+    "entry_order_id": 7421204,
+    "type": "C"
   }
 }
