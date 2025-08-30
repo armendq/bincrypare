@@ -1,10 +1,10 @@
 {
-  "_last_run": "2025-08-30 15:25:30",
+  "_last_run": "2025-08-30 17:56:33",
   "_last_balance": {
     "asset": "USDC",
-    "free": 13.00201351,
-    "locked": 15.54816425,
-    "total": 28.55017776
+    "free": 3.00042386,
+    "locked": 15.0281119,
+    "total": 18.02853576
   },
   "PHAUSDC": {
     "entry": 0.1105304,
@@ -34,24 +34,26 @@
     "stop": 3.02915617,
     "t1": 3.15670648,
     "t2": 3.17267542,
-    "filled_qty": 0.0,
+    "filled_qty": 1.75,
     "t1_filled_qty": 0.0,
-    "status": "pending",
+    "status": "live",
     "entry_order_id": 114230521,
     "type": "C",
-    "tps_placed": false
+    "tps_placed": false,
+    "activated_at": 1756576595.280116
   },
   "NOTUSDC": {
     "entry": 0.00180135,
     "stop": 0.0017328,
     "t1": 0.0018152,
     "t2": 0.00182733,
-    "filled_qty": 0.0,
+    "filled_qty": 2792.0,
     "t1_filled_qty": 0.0,
-    "status": "pending",
+    "status": "live",
     "entry_order_id": 192194354,
     "type": "C",
-    "tps_placed": false
+    "tps_placed": false,
+    "activated_at": 1756576596.727753
   },
   "1000SATSUSDC": {
     "entry": 3.714e-05,
