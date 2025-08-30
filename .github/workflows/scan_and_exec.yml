@@ -21,7 +21,7 @@ env:
   PYTHONUNBUFFERED: "1"
   BINANCE_BASE_URL: "https://data-api.binance.vision"
 
-  # Relaxed defaults for quiet markets (override via dispatch/env as needed)
+  # Scanner knobs
   RELAXED_SIGNALS: "1"
   IGNORE_REGIME: "1"
   RELAX_B_HIGH: "0"
@@ -36,8 +36,15 @@ env:
   MAX_RISK_CAP_PCT: "0.05"
   MAX_WORKERS: "12"
   LOG_LEVEL: "INFO"
-  ALLOW_MIN_ORDER: "1"   # enable fallback
-  MIN_ORDER_USD:  "6"    # at least $6 notional (>= exchange min)
+
+  # Executor knobs
+  ALLOW_MIN_ORDER: "1"
+  MIN_ORDER_USD: "6"
+  PENDING_TTL_H: "3"
+  EARLY_CANCEL_R: "0.5"
+  LIVE_TTL_H: "36"
+  STALE_CHECK_H: "8"
+  STALE_MIN_MFE_R: "0.3"
 
 jobs:
   run:
@@ -85,7 +92,6 @@ jobs:
                 "| eligible:", uni.get("eligible"),
                 "| cands:", len(p.get("candidates",[])),
                 "| orders:", len(p.get("orders",[])))
-          # safe: only prints if present
           if p.get("meta",{}).get("near_misses"):
               print("Near-misses:", p["meta"]["near_misses"])
           PY
