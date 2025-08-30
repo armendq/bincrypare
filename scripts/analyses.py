@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Analyses pipeline – scanner for pre-breakouts and breakouts (USDC universe)
+Analyses pipeline - scanner for pre-breakouts and breakouts (USDC universe)
 
-- Universe: all Binance Spot pairs with quoteAsset == USDC (TRADING, non-stable, non-leveraged)
+- Universe: Binance Spot pairs with quoteAsset == USDC (TRADING, non-stable, non-leveraged)
 - BTC reference: BTCUSDC
 - Signals:
     B  = confirmed breakout
-    C  = pre-breakout / continuation (optionally allows slight post-HH20 proximity)
-- Output: public_runs/latest/summary.json and timestamped copy under public_runs/YYYYmmdd_HHMMSS/
+    C  = pre-breakout / continuation
+- Output: public_runs/latest/summary.json and timestamped under public_runs/YYYYmmdd_HHMMSS/
 - Notes:
     * 'missing_binance' is always [] to keep downstream contract stable.
-    * Environment variables control thresholds; RELAXED_SIGNALS auto-widens gates.
+    * Environment variables control thresholds; RELAXED_SIGNALS widens gates.
+    * Optional REQUIRE_LOWER_TF_OK enforces 15m+5m momentum confirmation.
+    * Feasibility check uses exchange filters so we do not emit untradeable ideas.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ import json
 import logging
 import os
 import random
-import statistics
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,21 +61,25 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
 SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "20"))
 
 # Heuristics / thresholds (env)
-PROX_ATR_MIN = float(os.getenv("PROX_ATR_MIN", "0.00"))     # allow negative if you want continuation C
-PROX_ATR_MAX = float(os.getenv("PROX_ATR_MAX", "0.70"))
-VOL_Z_MIN_PRE = float(os.getenv("VOL_Z_MIN_PRE", "0.7"))
-VOL_Z_MIN_BREAK = float(os.getenv("VOL_Z_MIN_BREAK", "0.9"))
-BREAK_BUFFER_ATR = float(os.getenv("BREAK_BUFFER_ATR", "0.04"))
-RELAX_B_HIGH = os.getenv("RELAX_B_HIGH", "0") == "1"        # confirm by 1h high instead of close
-ALLOW_RUNAWAY_ATR = float(os.getenv("ALLOW_RUNAWAY_ATR", "3.0"))  # allow B up to K*ATR above HH20
+PROX_ATR_MIN = float(os.getenv("PROX_ATR_MIN", "0.00"))
+PROX_ATR_MAX = float(os.getenv("PROX_ATR_MAX", "0.60"))
+VOL_Z_MIN_PRE = float(os.getenv("VOL_Z_MIN_PRE", "0.8"))
+VOL_Z_MIN_BREAK = float(os.getenv("VOL_Z_MIN_BREAK", "1.0"))
+BREAK_BUFFER_ATR = float(os.getenv("BREAK_BUFFER_ATR", "0.03"))
+RELAX_B_HIGH = os.getenv("RELAX_B_HIGH", "0") == "1"
+ALLOW_RUNAWAY_ATR = float(os.getenv("ALLOW_RUNAWAY_ATR", "3.0"))
 
 # Liquidity / sizing metadata (advisory only)
-MIN_AVG_VOL = float(os.getenv("MIN_AVG_VOL", "2500"))  # approx USDC across last 10 x 1h bars
+MIN_AVG_VOL = float(os.getenv("MIN_AVG_VOL", "1500"))  # approx USDC across last 10 x 1h bars
 CAPITAL = float(os.getenv("CAPITAL", "10000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 
-# Relaxations switch
-RELAXED_SIGNALS = os.getenv("RELAXED_SIGNALS", "0") == "1"
+# Relaxations and confirmations
+RELAXED_SIGNALS = os.getenv("RELAXED_SIGNALS", "1") == "1"
+REQUIRE_LOWER_TF_OK = os.getenv("REQUIRE_LOWER_TF_OK", "1") == "1"
+
+# Feasibility pre-check to avoid suggesting untradeables on small accounts
+ANALYSES_MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", os.getenv("ANALYSES_MIN_ORDER_USD", "6")))
 
 # Execution / logging
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "10"))
@@ -152,6 +157,28 @@ def vol_zscore(vols: np.ndarray, window: int = 50) -> float:
     return float((vols[-1] - mu) / sd)
 
 # -------------------------- DATA FETCH --------------------------------
+
+def _filters_from_symbol_meta(meta: dict) -> Dict[str, float]:
+    """Extract useful filters (minQty, stepSize, tickSize, minNotional)."""
+    fmin_qty = fstep = ftick = fmin_notional = 0.0
+    for f in meta.get("filters", []):
+        ft = f.get("filterType")
+        if ft == "LOT_SIZE":
+            fmin_qty = float(f.get("minQty", "0"))
+            fstep = float(f.get("stepSize", "0"))
+        elif ft == "PRICE_FILTER":
+            ftick = float(f.get("tickSize", "0"))
+        elif ft in ("NOTIONAL", "MIN_NOTIONAL"):
+            try:
+                fmin_notional = float(f.get("minNotional", "0"))
+            except Exception:
+                fmin_notional = 0.0
+    return {
+        "min_qty": fmin_qty,
+        "step_qty": fstep,
+        "tick": ftick,
+        "min_notional": max(ANALYSES_MIN_ORDER_USD, fmin_notional or 0.0),
+    }
 
 def fetch_exchange_usdc_symbols() -> Dict[str, dict]:
     """Return dict of USDC spot symbols metadata keyed by symbol (e.g., 'LPTUSDC')."""
@@ -265,7 +292,7 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
         if avg_vol_usdc < MIN_AVG_VOL:
             return None
 
-        # Proximity (in ATRs) – negative means already above HH20
+        # Proximity (in ATRs) - negative means already above HH20
         prox = float((hh20[-1] - close_1h[-1]) / max(1e-9, atr_1h[-1]))
         atr_rising = bool(atr_1h[-1] > atr_1h[-2] > atr_1h[-3])
 
@@ -289,7 +316,6 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
 
         last_close = float(close_1h[-1])
         last_high  = float(high_1h[-1])
-        last_low   = float(low_1h[-1])
         last_atr   = float(atr_1h[-1])
         breakout_level = float(hh20[-1])
         confirm_price = last_high if RELAX_B_HIGH else last_close
@@ -297,14 +323,23 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
         # Relaxed gates
         trend_ok_relaxed = trend_ok or (RELAXED_SIGNALS and (lower_tf_ok or vz >= 0.5 or rs_strength > 0.1))
 
+        # Optional hard requirement for lower TF
+        if REQUIRE_LOWER_TF_OK and not lower_tf_ok:
+            # Allow only if both trends strong AND vz very high, to not kill all signals in rare moments
+            if not (trend_ok and vz >= max(VOL_Z_MIN_PRE, 1.2)):
+                # record a miss reason by returning minimal info
+                out = {"signal": "N", "miss_reasons": ["no_lowerTF_hard"]}
+                return out  # upstream treats None as no-data; we want a counted analysis
+
         # Apply dynamic relax multipliers if RELAXED_SIGNALS
-        vz_pre  = VOL_Z_MIN_PRE * (0.8 if RELAXED_SIGNALS else 1.0)
-        vz_brk  = VOL_Z_MIN_BREAK * (0.75 if RELAXED_SIGNALS else 1.0)
+        vz_pre  = VOL_Z_MIN_PRE * (0.85 if RELAXED_SIGNALS else 1.0)
+        vz_brk  = VOL_Z_MIN_BREAK * (0.8 if RELAXED_SIGNALS else 1.0)
         prox_min = PROX_ATR_MIN - (0.2 if RELAXED_SIGNALS else 0.0)  # allow slightly more above HH20
         prox_max = PROX_ATR_MAX + (0.3 if RELAXED_SIGNALS else 0.0)
 
-        # Confirmed breakout
         within_runaway = (last_close <= breakout_level + ALLOW_RUNAWAY_ATR * last_atr)
+
+        # Confirmed breakout
         confirmed_breakout = (
             trend_ok_relaxed and
             (confirm_price > (breakout_level + BREAK_BUFFER_ATR * last_atr)) and
@@ -314,7 +349,6 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
         )
 
         # Pre-breakout / continuation
-        # allow prox negative (price just over HH20) if within prox_min (can be negative) and RELAXED_SIGNALS widens range
         pre_breakout = (
             trend_ok_relaxed and
             (prox_min <= prox <= prox_max) and
@@ -324,7 +358,7 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
 
         # Levels and advisory size
         entry = breakout_level + BREAK_BUFFER_ATR * last_atr
-        stop  = float(ll20[-1]) - 0.3 * last_atr  # small buffer under LL20
+        stop  = float(ll20[-1]) - 0.3 * last_atr  # buffer under LL20
         t1    = entry + 0.8 * last_atr
         t2    = entry + 1.5 * last_atr
 
@@ -345,8 +379,8 @@ def analyze_symbol(symbol: str, btc_1h_close: np.ndarray, req: Dict[str, Dict[st
         if prox > 0: score += 1.0 / (min(max(prox, 0.01), 2.0))
         score += max(0.0, 5.0 * rs_strength)
         if lower_tf_ok: score += 0.5
-        score += float(np.log1p(max(0.0, avg_vol_usdc) / 1e5))  # liquidity boost
-        if not trend_ok and trend_ok_relaxed: score += 0.2  # slight boost for relaxed trend gate
+        score += float(np.log1p(max(0.0, float(np.nan_to_num(np.array([avg_vol_usdc]))[0])) / 1e5))
+        if not trend_ok and trend_ok_relaxed: score += 0.2
 
         out: Dict[str, Any] = {
             "symbol": symbol,
@@ -397,17 +431,24 @@ def write_summary(payload: dict, dest_latest: Path) -> None:
 
 # -------------------------- PIPELINE ----------------------------------
 
-def build_universe() -> Tuple[Dict[str, str], List[str]]:
+def build_universe() -> Tuple[Dict[str, str], Dict[str, Dict[str, float]]]:
+    """
+    Returns:
+      mapping: {base: symbol}
+      filt: {symbol: {min_qty, step_qty, tick, min_notional}}
+    """
     exch = fetch_exchange_usdc_symbols()
     if not exch:
-        return {}, []
+        return {}, {}
     mapping: Dict[str, str] = {}
+    filt: Dict[str, Dict[str, float]] = {}
     for sym, meta in exch.items():
-        base = meta.get("baseAsset", "").upper()
+        base = str(meta.get("baseAsset", "")).upper()
         if not base:
             continue
         mapping[base] = sym
-    return mapping, []
+        filt[sym] = _filters_from_symbol_meta(meta)
+    return mapping, filt
 
 def compute_regime(btc_1h: Dict[str, np.ndarray], btc_4h: Dict[str, np.ndarray]) -> Tuple[bool, str]:
     try:
@@ -425,7 +466,8 @@ def compute_regime(btc_1h: Dict[str, np.ndarray], btc_4h: Dict[str, np.ndarray])
     except Exception:
         return False, "regime calc error"
 
-def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Optional[int] = None) -> dict:
+def process(symbols: List[str], sym_filters: Dict[str, Dict[str, float]],
+            mode: str, ignore_regime: bool, end_time: Optional[int] = None) -> dict:
     started = datetime.now(timezone.utc).astimezone(TZ) if end_time is None else datetime.fromtimestamp(end_time / 1000, timezone.utc).astimezone(TZ)
 
     # Baseline BTC
@@ -468,6 +510,7 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
     no_data: List[str] = []
     all_infos: List[dict] = []
     scanned = 0
+    near_miss_compact: List[dict] = []
 
     for sym in symbols:
         scanned += 1
@@ -475,23 +518,50 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
         if any(v is None for v in tf_data.values()):
             no_data.append(sym.split("USDC")[0])
             continue
+
         info = analyze_symbol(sym, btc_close_1h, tf_data)  # type: ignore
         if not info:
             no_data.append(sym.split("USDC")[0])
             continue
+
+        # Ensure tkr and rotation flag
         info["ticker"] = sym.split("USDC")[0]
         info["rotation_exempt"] = False
+
+        # Feasibility pre-check vs filters (avoid untradeables)
+        f = sym_filters.get(sym, {"min_qty": 0.0, "step_qty": 0.0, "tick": 0.0, "min_notional": ANALYSES_MIN_ORDER_USD})
+        entry = float(info.get("entry", 0.0))
+        min_notional = float(f.get("min_notional", ANALYSES_MIN_ORDER_USD)) or ANALYSES_MIN_ORDER_USD
+        min_qty = float(f.get("min_qty", 0.0))
+        feasible = (entry > 0) and ((entry * max(min_qty, ANALYSES_MIN_ORDER_USD / max(entry, 1e-12))) >= min_notional - 1e-9)
+        info["feasible"] = bool(feasible)
+        info["filters"] = {"min_qty": f["min_qty"], "step_qty": f["step_qty"], "tick": f["tick"], "min_notional": min_notional}
+
+        # Sort into buckets
         all_infos.append(info)
-        if info["signal"] == "B":
-            confirmed.append(info)
-        elif info["signal"] == "C":
-            candidates.append(info)
+        sig = info.get("signal")
+        if sig == "B":
+            if feasible:
+                confirmed.append(info)
+        elif sig == "C":
+            if feasible:
+                candidates.append(info)
+        else:
+            # compact near-miss collection for payload
+            if len(near_miss_compact) < NEAR_MISS_LOG_COUNT:
+                near_miss_compact.append({
+                    "symbol": sym,
+                    "vz": round(float(info.get("vol_z", 0.0)), 2),
+                    "prox": round(float(info.get("prox_atr", 0.0)), 2),
+                    "score": round(float(info.get("score", 0.0)), 2),
+                    "miss": info.get("miss_reasons", []),
+                })
 
     # Near-miss logging (top N non-signals)
     non_signals = [i for i in all_infos if i.get("signal") == "N"]
     non_signals.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     for ns in non_signals[:NEAR_MISS_LOG_COUNT]:
-        logging.info(f"Near-miss {ns['symbol']}: score={ns['score']:.2f}, vz={ns['vol_z']:.2f}, prox={ns['prox_atr']:.2f}, miss={ns.get('miss_reasons', [])}")
+        logging.info(f"Near-miss {ns['symbol']}: score={ns.get('score',0):.2f}, vz={ns.get('vol_z',0):.2f}, prox={ns.get('prox_atr',0):.2f}, miss={ns.get('miss_reasons', [])}")
 
     if not regime_ok:
         return {
@@ -502,7 +572,7 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
             "orders": [],
             "candidates": [],
             "universe": {"scanned": scanned, "eligible": len(symbols), "skipped": {"no_data": sorted(no_data), "missing_binance": []}},
-            "meta": {"binance_endpoint": BASE_URL, "mode": mode},
+            "meta": {"binance_endpoint": BASE_URL, "mode": mode, "near_misses": near_miss_compact},
         }
 
     candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
@@ -516,16 +586,17 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
             orders.append({
                 "ticker": o["ticker"],
                 "symbol": o["symbol"],
-                "entry": round(o["entry"], 8),
-                "stop": round(o["stop"], 8),
-                "t1": round(o["t1"], 8),
-                "t2": round(o["t2"], 8),
-                "atr": round(o["atr"], 8),
+                "entry": round(float(o["entry"]), 8),
+                "stop": round(float(o["stop"]), 8),
+                "t1": round(float(o["t1"]), 8),
+                "t2": round(float(o["t2"]), 8),
+                "atr": round(float(o["atr"]), 8),
                 "tf": "1h",
                 "notes": o.get("reasons", []),
                 "rotation_exempt": False,
-                "position_size": round(o["position_size"], 8),
-                "position_size_usdc": round(o["position_size_usdc"], 2),
+                "position_size": round(float(o["position_size"]), 8),
+                "position_size_usdc": round(float(o["position_size_usdc"]), 2),
+                "filters": o.get("filters", {}),
             })
     elif top_candidates:
         signal_type = "C"
@@ -533,21 +604,22 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
     cand_payload = [{
         "ticker": c["ticker"],
         "symbol": c["symbol"],
-        "last": round(c["last"], 8),
-        "atr": round(c["atr"], 8),
-        "entry": round(c["entry"], 8),
-        "stop": round(c["stop"], 8),
-        "t1": round(c["t1"], 8),
-        "t2": round(c["t2"], 8),
-        "score": round(c["score"], 4),
-        "vol_z": round(c["vol_z"], 2),
-        "prox_atr": round(c["prox_atr"], 3),
-        "rs10": round(c["rs10"], 4),
+        "last": round(float(c["last"]), 8),
+        "atr": round(float(c["atr"]), 8),
+        "entry": round(float(c["entry"]), 8),
+        "stop": round(float(c["stop"]), 8),
+        "t1": round(float(c["t1"]), 8),
+        "t2": round(float(c["t2"]), 8),
+        "score": round(float(c["score"]), 4),
+        "vol_z": round(float(c["vol_z"]), 2),
+        "prox_atr": round(float(c["prox_atr"]), 3),
+        "rs10": round(float(c.get("rs10", 0.0)), 4),
         "tf": "1h",
         "notes": c.get("reasons", []),
         "rotation_exempt": False,
-        "position_size": round(c["position_size"], 8),
-        "position_size_usdc": round(c["position_size_usdc"], 2),
+        "position_size": round(float(c["position_size"]), 8),
+        "position_size_usdc": round(float(c["position_size_usdc"]), 2),
+        "filters": c.get("filters", {}),
     } for c in top_candidates]
 
     payload: Dict[str, Any] = {
@@ -578,11 +650,14 @@ def process(symbols: List[str], mode: str, ignore_regime: bool, end_time: Option
                 "CAPITAL": CAPITAL,
                 "RISK_PER_TRADE": RISK_PER_TRADE,
                 "RELAXED_SIGNALS": RELAXED_SIGNALS,
+                "REQUIRE_LOWER_TF_OK": REQUIRE_LOWER_TF_OK,
+                "ANALYSES_MIN_ORDER_USD": ANALYSES_MIN_ORDER_USD,
             },
             "lower_tf_confirm": True,
             "rs_reference": "BTCUSDC",
             "binance_endpoint": BASE_URL,
             "mode": mode,
+            "near_misses": near_miss_compact,
         }
     }
     return payload
@@ -597,9 +672,9 @@ def run_pipeline(mode: str, ignore_regime: bool = False,
         results = []
         while cur <= end_dt:
             end_ms = int(cur.timestamp() * 1000)
-            mapping, _ = build_universe()
+            mapping, filt = build_universe()
             symbols = list(mapping.values())
-            results.append(process(symbols, mode, ignore_regime, end_ms))
+            results.append(process(symbols, filt, mode, ignore_regime, end_ms))
             cur += timedelta(days=1)
         stats = {
             "total_days": len(results),
@@ -609,7 +684,7 @@ def run_pipeline(mode: str, ignore_regime: bool = False,
         return {"backtest_results": results, "stats": stats}
 
     # Live mode
-    mapping, _ = build_universe()
+    mapping, filt = build_universe()
     if not mapping:
         return {
             "generated_at": human_time(),
@@ -622,7 +697,7 @@ def run_pipeline(mode: str, ignore_regime: bool = False,
             "meta": {"binance_endpoint": BASE_URL, "mode": mode},
         }
     symbols = list(mapping.values())
-    return process(symbols, mode, ignore_regime)
+    return process(symbols, filt, mode, ignore_regime)
 
 # ------------------------------ CLI -----------------------------------
 
