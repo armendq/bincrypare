@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Execution bot for Binance Spot (USDC quote)
-- Reads summary.json (local file or URL)
-- Places stop-limit BUYs for C candidates (optional)
-- Places market BUYs for B breakouts
-- Places two TP LIMITs after entry
-- Tracks open state in state/open_positions.json
-- Promotes pending -> live when exchange order fills
-- Skips any order that breaches minNotional before submitting
-"""
-
 import os, json, time, math, requests
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Tuple, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
 
 from binance.client import Client
 from binance.enums import (
@@ -23,49 +11,46 @@ from binance.enums import (
     ORDER_TYPE_MARKET, ORDER_TYPE_STOP_LOSS_LIMIT, ORDER_TYPE_LIMIT
 )
 
-# -------------------- ENV / CONFIG --------------------
+# ========= ENV / CONFIG =========
+SUMMARY_URL         = os.getenv("SUMMARY_URL", "https://raw.githubusercontent.com/armendq/bincrypare/main/public_runs/latest/summary.json")
+QUOTE_ASSET         = os.getenv("QUOTE_ASSET", "USDC")
+DRY_RUN             = os.getenv("DRY_RUN", "1") == "1"
 
-SUMMARY_URL        = os.getenv("SUMMARY_URL", "https://raw.githubusercontent.com/armendq/bincrypare/main/public_runs/latest/summary.json")
-QUOTE_ASSET        = os.getenv("QUOTE_ASSET", "USDC")
-DRY_RUN            = os.getenv("DRY_RUN", "1") == "1"
+FORCE_EQUITY        = float(os.getenv("FORCE_EQUITY_USD", "0"))
+RISK_PCT            = float(os.getenv("RISK_PCT", "0.012"))   # 1.2% default
 
-# sizing
-FORCE_EQUITY_USD   = float(os.getenv("FORCE_EQUITY_USD", "0"))  # if >0, overrides live free balance
-RISK_PCT           = float(os.getenv("RISK_PCT", "0.012"))       # 1.2% risk/trade baseline
+# Candidate trading
+TRADE_CANDS         = os.getenv("TRADE_CANDIDATES", "1") == "1"
+C_RISK_MULT         = float(os.getenv("C_RISK_MULT", "0.7"))
+STOP_LIMIT_OFFSET   = float(os.getenv("STOP_LIMIT_OFFSET", "0.002"))  # 0.2% over stop
 
-# candidates trading
-TRADE_CANDIDATES   = os.getenv("TRADE_CANDIDATES", "1") == "1"
-C_RISK_MULT        = float(os.getenv("C_RISK_MULT", "0.5"))      # risk fraction for C
-STOP_LIMIT_OFFSET  = float(os.getenv("STOP_LIMIT_OFFSET", "0.001"))  # +0.1% above stop-price
-
-# min notional handling
+# Exchange / filters
 MIN_NOTIONAL_FALLBACK = float(os.getenv("MIN_NOTIONAL", "5.0"))
-ALLOW_MIN_ORDER    = os.getenv("ALLOW_MIN_ORDER", "0") == "1"    # allow micro order fallback
-MIN_ORDER_USD      = float(os.getenv("MIN_ORDER_USD", "6"))      # at least this much if fallback used
+MIN_ORDER_USD       = float(os.getenv("MIN_ORDER_USD", "6.0"))
+ALLOW_MIN_ORDER     = os.getenv("ALLOW_MIN_ORDER", "1") == "1"
 
-# lifecycle rules (timeouts)
-PENDING_MAX_MINUTES = int(os.getenv("PENDING_MAX_MINUTES", "180"))  # cancel pendings older than this
-LIVE_MAX_HOURS      = int(os.getenv("LIVE_MAX_HOURS", "12"))        # optional time-stop for live
-ENABLE_TIME_STOP    = os.getenv("ENABLE_TIME_STOP", "1") == "1"     # enable the live position time-stop rule
+# Lifecycle rules
+PEND_MAX_MINUTES        = int(os.getenv("PEND_MAX_MINUTES", "180"))  # 3h
+PROMOTE_MIN_FILL_PCT    = float(os.getenv("PROMOTE_MIN_FILL_PCT", "0.25"))  # promote after 25% filled
+LIVE_MAX_HOURS          = float(os.getenv("LIVE_MAX_HOURS", "12"))  # max live age
+STOP_SLIPPAGE_PCT       = float(os.getenv("STOP_SLIPPAGE_PCT", "0.001"))  # 0.1% under stop for market exit
 
-API_KEY    = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+API_KEY   = os.getenv("BINANCE_API_KEY", "")
+API_SECRET= os.getenv("BINANCE_API_SECRET", "")
 
-STATE_DIR  = Path("state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR  = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "open_positions.json"
 
 client = Client(API_KEY, API_SECRET)
 
-# -------------------- UTIL --------------------
-
-def now_utc() -> datetime:
+# ========= UTILS =========
+def now_utc():
     return datetime.now(timezone.utc)
 
-def now_str() -> str:
+def now_str():
     return now_utc().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-def log(msg: str) -> None:
+def log(msg: str):
     print(f"[exec {now_str()}] {msg}", flush=True)
 
 def load_state() -> dict:
@@ -81,8 +66,8 @@ def save_state(state: dict) -> None:
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), "utf-8")
     tmp.replace(STATE_FILE)
 
-def fetch_summary() -> Optional[dict]:
-    # local file path support
+def fetch_summary() -> dict | None:
+    # Support local file:// or remote URL
     if SUMMARY_URL.startswith("file://"):
         try:
             p = SUMMARY_URL.replace("file://", "", 1)
@@ -91,148 +76,18 @@ def fetch_summary() -> Optional[dict]:
         except Exception as e:
             log(f"[LOCAL READ ERROR] {e}")
             return None
-    # http(s)
     for attempt in (1, 2):
         try:
-            r = requests.get(SUMMARY_URL, timeout=20)
+            r = requests.get(SUMMARY_URL, timeout=25)
             if r.status_code == 200:
                 return r.json()
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(2)
     log("Hold and wait. Fetch failed twice.")
     return None
 
-# -------------- BINANCE FILTERS & ROUNDING --------------
-
-def get_symbol_filters(symbol: str) -> Tuple[float, float, float, float]:
-    """
-    Returns (minQty, stepSize, tickSize, minNotional)
-    """
-    info = client.get_symbol_info(symbol)
-    lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-    pricef = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
-    notional = next((f for f in info["filters"] if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL")), {})
-    min_notional = float(notional.get("minNotional", MIN_NOTIONAL_FALLBACK)) if notional else MIN_NOTIONAL_FALLBACK
-    return float(lot["minQty"]), float(lot["stepSize"]), float(pricef["tickSize"]), max(MIN_NOTIONAL_FALLBACK, min_notional)
-
-def floor_to_step(v: float, step: float) -> float:
-    if step <= 0:
-        return v
-    # use decimal-like floor by integer division
-    return math.floor(v / step) * step
-
-def round_to_tick(p: float, tick: float) -> float:
-    if tick <= 0:
-        return p
-    return floor_to_step(p, tick)
-
-# -------------------- SIZING --------------------
-
-def compute_qty(entry: float, stop: float, equity: float,
-                min_qty: float, step_qty: float, min_notional: float,
-                price_for_notional: float,
-                allow_min_order: bool) -> Tuple[float, str]:
-    """
-    Returns (qty, reason)
-      - qty == 0 means 'do not trade' with reason
-      - qty > 0 is rounded to step and passes notional/lot minimums
-    """
-    # risk dollars
-    risk_dollars = max(equity * RISK_PCT, 0.0)
-
-    # risk per unit (distance from entry to stop, but not less than 0.2%)
-    rpu = max(entry - stop, entry * 0.002)
-    if rpu <= 0:
-        return 0.0, "bad_risk_params"
-
-    raw_qty = risk_dollars / rpu
-
-    # ensure meets minNotional
-    min_qty_by_notional = min_notional / max(price_for_notional, 1e-12)
-    raw_qty = max(raw_qty, min_qty_by_notional)
-
-    qty = floor_to_step(raw_qty, step_qty)
-
-    # If still below minQty, optionally try a micro fallback based on MIN_ORDER_USD
-    if qty < min_qty:
-        if allow_min_order:
-            micro = MIN_ORDER_USD / max(price_for_notional, 1e-12)
-            qty2 = floor_to_step(max(micro, min_qty), step_qty)
-            notional2 = qty2 * price_for_notional
-            if qty2 >= min_qty and notional2 >= min_notional:
-                return qty2, "fallback_min_order"
-        return 0.0, "below_lot_size"
-
-    # final notional guard
-    if qty * price_for_notional < min_notional:
-        if allow_min_order:
-            micro = MIN_ORDER_USD / max(price_for_notional, 1e-12)
-            qty2 = floor_to_step(max(qty, micro), step_qty)
-            if qty2 * price_for_notional >= min_notional and qty2 >= min_qty:
-                return qty2, "fallback_notional"
-        return 0.0, "below_notional"
-
-    return qty, "ok"
-
-# -------------------- ORDER WRAPPERS --------------------
-
-def place_market_buy(symbol: str, qty: float) -> Optional[dict]:
-    if DRY_RUN:
-        log(f"[MARKET BUY dry] {symbol} qty={qty:.8f}")
-        return {"orderId": "dry"}
-    try:
-        o = client.create_order(symbol=symbol, side=SIDE_BUY,
-                                type=ORDER_TYPE_MARKET, quantity=qty)
-        log(f"[MARKET BUY] {symbol} qty={qty:.8f} id={o.get('orderId')}")
-        return o
-    except Exception as e:
-        log(f"[ENTRY ERROR] {symbol}: {e}")
-        return None
-
-def place_stop_limit_buy(symbol: str, qty: float, entry: float, tick: float) -> Optional[dict]:
-    """
-    Use stopPrice = rounded entry, limitPrice slightly above (by STOP_LIMIT_OFFSET)
-    """
-    stop_px  = round_to_tick(entry, tick)
-    limit_px = round_to_tick(entry * (1 + STOP_LIMIT_OFFSET), tick)
-    if DRY_RUN:
-        log(f"[STOP-LIMIT BUY dry] {symbol} qty={qty:.8f} stop={stop_px} limit={limit_px}")
-        return {"orderId": "dry"}
-    try:
-        o = client.create_order(
-            symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_STOP_LOSS_LIMIT,
-            timeInForce=TIME_IN_FORCE_GTC, quantity=qty,
-            price=f"{limit_px:.08f}", stopPrice=f"{stop_px:.08f}"
-        )
-        log(f"[STOP-LIMIT BUY] {symbol} qty={qty:.8f} stop={stop_px} limit={limit_px} id={o.get('orderId')}")
-        return o
-    except Exception as e:
-        log(f"[STOP-LIMIT ERROR] {symbol}: {e}")
-        return None
-
-def place_tp_limits(symbol: str, qty: float, t1: float, t2: float, tick: float) -> Tuple[Optional[dict], Optional[dict]]:
-    q1 = floor_to_step(qty * 0.5, 1e-8)
-    q2 = max(qty - q1, 0.0)
-    p1 = round_to_tick(t1, tick)
-    p2 = round_to_tick(t2, tick)
-    if DRY_RUN:
-        log(f"[TP dry] {symbol} sell {q1:.8f}@{p1} and {q2:.8f}@{p2}")
-        return {"orderId": "dry"}, {"orderId": "dry"}
-    try:
-        o1 = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT,
-                                 timeInForce=TIME_IN_FORCE_GTC, quantity=q1, price=f"{p1:.08f}")
-        o2 = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT,
-                                 timeInForce=TIME_IN_FORCE_GTC, quantity=q2, price=f"{p2:.08f}")
-        log(f"[TP] {symbol} t1 {q1:.8f}@{p1} id={o1.get('orderId')}; t2 {q2:.8f}@{p2} id={o2.get('orderId')}")
-        return o1, o2
-    except Exception as e:
-        log(f"[TP ERROR] {symbol}: {e}")
-        return None, None
-
-# -------------------- ACCOUNT & EQUITY --------------------
-
-def get_spot_balance(asset: str) -> Tuple[float, float, float]:
+def get_spot_balance(asset: str) -> tuple[float, float, float]:
     try:
         acct = client.get_account()
     except Exception as e:
@@ -247,209 +102,400 @@ def get_spot_balance(asset: str) -> Tuple[float, float, float]:
     return free, locked, free + locked
 
 def equity_for_sizing() -> float:
-    if FORCE_EQUITY_USD > 0:
-        return FORCE_EQUITY_USD
+    if FORCE_EQUITY > 0:
+        return FORCE_EQUITY
     free, _, _ = get_spot_balance(QUOTE_ASSET)
+    if free < MIN_ORDER_USD:
+        log(f"[EQUITY SKIP] free={free:.2f} < MIN_ORDER_USD={MIN_ORDER_USD}")
+        return 0.0
     return free
 
-# -------------------- ORDER MANAGEMENT --------------------
+def floor_to_step(v: float, step: float) -> float:
+    if step <= 0:
+        return v
+    return math.floor(v / step) * step
 
-def fetch_avg_price(symbol: str) -> Optional[float]:
-    """Lightweight price for notional checks if needed."""
+def round_to_tick(p: float, tick: float) -> float:
+    if tick <= 0:
+        return p
+    return floor_to_step(p, tick)
+
+def get_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
+    """Return (minQty, stepQty, tickSize, minNotional)"""
+    info = client.get_symbol_info(symbol)
+    lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    pricef = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+    notional = next((f for f in info["filters"] if f["filterType"] in ("NOTIONAL","MIN_NOTIONAL")), {})
+    min_notional = float(notional.get("minNotional", MIN_NOTIONAL_FALLBACK)) if notional else MIN_NOTIONAL_FALLBACK
+    return float(lot["minQty"]), float(lot["stepSize"]), float(pricef["tickSize"]), max(MIN_NOTIONAL_FALLBACK, min_notional)
+
+def get_last_price(symbol: str) -> float | None:
     try:
-        d = client.get_symbol_ticker(symbol=symbol)
-        return float(d["price"])
+        t = client.get_symbol_ticker(symbol=symbol)
+        return float(t["price"])
     except Exception:
         return None
 
-def poll_order(symbol: str, order_id: Any) -> Optional[dict]:
-    try:
-        return client.get_order(symbol=symbol, orderId=order_id)
-    except Exception:
-        return None
+# ========= SIZING =========
+def compute_qty(entry: float, stop: float, equity: float,
+                min_qty: float, step_qty: float, min_notional: float,
+                allow_min_order: bool) -> float:
+    """Risk-based position size with MIN_NOTIONAL guard and optional min-order fallback."""
+    if equity <= 0 or entry <= 0 or stop <= 0:
+        return 0.0
+    risk_dollars = equity * RISK_PCT
+    rpu = max(entry - stop, entry * 0.001)  # per-unit risk, floor at 0.1% of entry
+    if rpu <= 0:
+        return 0.0
+    raw_qty = risk_dollars / rpu
+    # Ensure notional at entry meets min_notional
+    raw_qty = max(raw_qty, min_notional / entry)
+    qty = floor_to_step(raw_qty, step_qty)
+    if qty < min_qty:
+        # Optionally try the absolute minimum order
+        if allow_min_order:
+            qty = floor_to_step(max(min_qty, min_notional / entry), step_qty)
+        else:
+            return 0.0
+    return qty
 
-def cancel_order(symbol: str, order_id: Any) -> bool:
+# ========= ORDER PLACEMENT =========
+def place_market_buy(symbol: str, qty: float) -> dict | None:
     if DRY_RUN:
-        log(f"[CANCEL dry] {symbol} id={order_id}")
-        return True
+        log(f"[MARKET BUY dry] {symbol} qty={qty:.8f}")
+        return {"orderId": "dry", "executedQty": f"{qty:.8f}", "status": "FILLED"}
     try:
-        client.cancel_order(symbol=symbol, orderId=order_id)
-        log(f"[CANCEL] {symbol} id={order_id}")
-        return True
+        o = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+        log(f"[MARKET BUY] {symbol} qty={qty:.8f} id={o.get('orderId')}")
+        return o
     except Exception as e:
-        log(f"[CANCEL ERROR] {symbol}: {e}")
-        return False
+        log(f"[ENTRY ERROR] {symbol}: {e}")
+        return None
 
-# -------------------- MAIN --------------------
+def place_market_sell(symbol: str, qty: float) -> dict | None:
+    if qty <= 0:
+        return None
+    if DRY_RUN:
+        log(f"[MARKET SELL dry] {symbol} qty={qty:.8f}")
+        return {"orderId":"dry", "executedQty": f"{qty:.8f}", "status": "FILLED"}
+    try:
+        o = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
+        log(f"[MARKET SELL] {symbol} qty={qty:.8f} id={o.get('orderId')}")
+        return o
+    except Exception as e:
+        log(f"[SELL ERROR] {symbol}: {e}")
+        return None
 
+def place_stop_limit_buy(symbol: str, qty: float, entry: float, tick: float,
+                         min_notional: float, free_funds: float) -> dict | None:
+    stop_px  = round_to_tick(entry, tick)
+    limit_px = round_to_tick(entry * (1 + STOP_LIMIT_OFFSET), tick)
+
+    # Pre-checks to avoid 2010/1013
+    last_px = get_last_price(symbol)
+    if last_px is not None and stop_px <= last_px:
+        log(f"[SKIP STOP-LIMIT] {symbol} stop={stop_px} <= lastPrice={last_px}")
+        return None
+
+    notional = qty * limit_px
+    if notional < min_notional:
+        log(f"[STOP-LIMIT SKIP] {symbol} notional {notional:.4f} < minNotional {min_notional:.4f}")
+        return None
+    if notional > max(0.0, free_funds - 0.01):
+        log(f"[STOP-LIMIT SKIP] {symbol} need {notional:.4f} > free {free_funds:.4f}")
+        return None
+
+    if DRY_RUN:
+        log(f"[STOP-LIMIT BUY dry] {symbol} qty={qty:.8f} stop={stop_px} limit={limit_px}")
+        return {"orderId":"dry", "status":"NEW"}
+
+    try:
+        o = client.create_order(
+            symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_STOP_LOSS_LIMIT,
+            timeInForce=TIME_IN_FORCE_GTC, quantity=qty,
+            price=f"{limit_px:.08f}", stopPrice=f"{stop_px:.08f}"
+        )
+        log(f"[STOP-LIMIT BUY] {symbol} qty={qty:.8f} stop={stop_px} limit={limit_px} id={o.get('orderId')}")
+        return o
+    except Exception as e:
+        log(f"[STOP-LIMIT ERROR] {symbol}: {e}")
+        return None
+
+def place_tp_limits(symbol: str, qty: float, t1: float, t2: float, tick: float,
+                    step_qty: float, min_qty: float, min_notional: float) -> tuple[dict|None, dict|None]:
+    """Place two TP limit sells; if either leg violates minNotional/lot, fall back to single TP at t2."""
+    if qty <= 0:
+        return None, None
+
+    qty = floor_to_step(qty, step_qty)  # refloor executed qty
+    if qty < min_qty:
+        log(f"[TP SKIP] {symbol} qty {qty:.8f} < minQty {min_qty}")
+        return None, None
+
+    q1 = floor_to_step(qty * 0.5, step_qty)
+    q2 = floor_to_step(qty - q1, step_qty)
+    if q1 < min_qty:  # push all to q2 if q1 too small
+        q1 = 0.0
+        q2 = floor_to_step(qty, step_qty)
+
+    p1 = round_to_tick(t1, tick)
+    p2 = round_to_tick(t2, tick)
+
+    not1 = q1 * p1
+    not2 = q2 * p2
+    # Fallback to single TP if any leg breaches minNotional
+    if (q1 > 0 and not1 < min_notional) or (q2 > 0 and not2 < min_notional):
+        if qty * p2 < min_notional:
+            log(f"[TP SKIP] {symbol} total notional {qty*p2:.4f} < minNotional {min_notional:.4f}")
+            return None, None
+        if DRY_RUN:
+            log(f"[TP dry fallback] {symbol} sell {qty:.8f}@{p2}")
+            return {"orderId":"dry"}, None
+        try:
+            o = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT,
+                                    timeInForce=TIME_IN_FORCE_GTC, quantity=qty, price=f"{p2:.08f}")
+            log(f"[TP fallback] {symbol} all {qty:.8f}@{p2} id={o.get('orderId')}")
+            return o, None
+        except Exception as e:
+            log(f"[TP ERROR] {symbol}: {e}")
+            return None, None
+
+    if DRY_RUN:
+        if q1 > 0: log(f"[TP dry] {symbol} {q1:.8f}@{p1}")
+        if q2 > 0: log(f"[TP dry] {symbol} {q2:.8f}@{p2}")
+        return ({"orderId":"dry"} if q1>0 else None), ({"orderId":"dry"} if q2>0 else None)
+
+    try:
+        o1 = None
+        if q1 > 0:
+            o1 = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT,
+                                     timeInForce=TIME_IN_FORCE_GTC, quantity=q1, price=f"{p1:.08f}")
+        o2 = None
+        if q2 > 0:
+            o2 = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT,
+                                     timeInForce=TIME_IN_FORCE_GTC, quantity=q2, price=f"{p2:.08f}")
+        if o1: log(f"[TP] {symbol} t1 {q1:.8f}@{p1} id={o1.get('orderId')}")
+        if o2: log(f"[TP] {symbol} t2 {q2:.8f}@{p2} id={o2.get('orderId')}")
+        return o1, o2
+    except Exception as e:
+        log(f"[TP ERROR] {symbol}: {e}")
+        return None, None
+
+# ========= WORKFLOW HELPERS =========
+def ensure_filters_in_pos(symbol: str, pos: dict) -> None:
+    """Guarantee tick/step/minQty/minNotional are present in the state slot."""
+    for k in ("min_qty","step_qty","tick","min_notional"):
+        if k not in pos:
+            min_qty, step_qty, tick, min_notional = get_symbol_filters(symbol)
+            pos["min_qty"] = min_qty
+            pos["step_qty"] = step_qty
+            pos["tick"] = tick
+            pos["min_notional"] = min_notional
+            pos.setdefault("ts", now_utc().timestamp())
+            return
+    # already present
+
+def age_hours(ts: float) -> float:
+    try:
+        return max(0.0, (now_utc() - datetime.fromtimestamp(ts, tz=timezone.utc)).total_seconds() / 3600.0)
+    except Exception:
+        return 0.0
+
+def maybe_activate_pending(symbol: str, pos: dict) -> None:
+    """If a pending stop-limit filled, promote to live and place TPs."""
+    ensure_filters_in_pos(symbol, pos)
+    oid = pos.get("entry_order_id")
+    if not oid:
+        return
+    try:
+        o = client.get_order(symbol=symbol, orderId=oid)
+    except Exception as e:
+        log(f"[ORDER QUERY] {symbol} {e}")
+        return
+
+    status = (o.get("status") or "").upper()
+    executed = float(o.get("executedQty", "0") or 0)
+
+    # Cancel stale pending
+    if status in ("NEW","PARTIALLY_FILLED"):
+        # TTL
+        if age_hours(float(pos.get("ts", now_utc().timestamp()))) >= (PEND_MAX_MINUTES / 60.0):
+            log(f"[PENDING CANCEL TTL] {symbol} > {PEND_MAX_MINUTES}m")
+            if not DRY_RUN:
+                try: client.cancel_order(symbol=symbol, orderId=oid)
+                except Exception as e: log(f"[CANCEL ERR] {symbol} {e}")
+            pos["status"] = "canceled"
+            return
+
+        # Promote once partial fills exceed threshold
+        orig_qty = float(o.get("origQty", "0") or 0)
+        if orig_qty > 0 and executed / orig_qty >= PROMOTE_MIN_FILL_PCT:
+            pos["filled_qty"] = executed
+
+            # Place TP on executed part
+            o1,o2 = place_tp_limits(
+                symbol,
+                executed,
+                pos["t1"], pos["t2"],
+                pos["tick"], pos["step_qty"], pos["min_qty"], pos["min_notional"]
+            )
+            pos["status"] = "live"
+            if o1: pos["tp1_order_id"] = o1.get("orderId")
+            if o2: pos["tp2_order_id"] = o2.get("orderId")
+            log(f"[PROMOTE] {symbol} pending -> live (qty={executed:.8f})")
+            return
+
+    if status == "FILLED":
+        # Promote full fill
+        executed = float(o.get("executedQty", "0") or 0)
+        executed = floor_to_step(executed, pos["step_qty"])
+        pos["filled_qty"] = executed
+        o1,o2 = place_tp_limits(
+            symbol, executed,
+            pos["t1"], pos["t2"],
+            pos["tick"], pos["step_qty"], pos["min_qty"], pos["min_notional"]
+        )
+        pos["status"] = "live"
+        if o1: pos["tp1_order_id"] = o1.get("orderId")
+        if o2: pos["tp2_order_id"] = o2.get("orderId")
+        log(f"[PROMOTE] {symbol} pending -> live (full)")
+        return
+
+    if status in ("CANCELED","REJECTED","EXPIRED"):
+        pos["status"] = "canceled"
+
+def manage_live(symbol: str, pos: dict) -> None:
+    """Time/stop management for live positions."""
+    ensure_filters_in_pos(symbol, pos)
+    qty = float(pos.get("filled_qty", 0.0))
+    if qty <= 0:
+        return
+
+    # Time-based exit
+    if age_hours(float(pos.get("ts", now_utc().timestamp()))) >= LIVE_MAX_HOURS:
+        log(f"[TIME EXIT] {symbol} live>{LIVE_MAX_HOURS}h")
+        if not DRY_RUN:
+            qty_s = floor_to_step(qty, pos["step_qty"])
+            place_market_sell(symbol, qty_s)
+        pos["status"] = "closed"
+        return
+
+    # Stop-based exit
+    last_px = get_last_price(symbol)
+    if last_px is None:
+        return
+    stop = float(pos.get("stop", 0.0) or 0)
+    if stop > 0 and last_px <= stop * (1 - STOP_SLIPPAGE_PCT):
+        qty_s = floor_to_step(qty, pos["step_qty"])
+        notional = qty_s * last_px
+        if qty_s <= 0 or notional < pos["min_notional"]:
+            log(f"[STOP EXIT SKIP] {symbol} qty/notional too small ({qty_s}, {notional:.4f})")
+            return
+        if DRY_RUN:
+            log(f"[STOP EXIT dry] {symbol} qty={qty_s:.8f} last={last_px}")
+        else:
+            place_market_sell(symbol, qty_s)
+        pos["status"] = "stopped"
+
+# ========= MAIN =========
 def main():
     free, locked, total = get_spot_balance(QUOTE_ASSET)
-    if FORCE_EQUITY_USD > 0:
-        log(f"Balance: OVERRIDE {FORCE_EQUITY_USD:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
+    if FORCE_EQUITY > 0:
+        log(f"Balance: OVERRIDE {FORCE_EQUITY:.2f} {QUOTE_ASSET} | live free={free:.2f}, locked={locked:.2f}, total={total:.2f}")
     else:
         log(f"Balance: live free={free:.2f}, locked={locked:.2f}, total={total:.2f} {QUOTE_ASSET}")
 
-    summary = fetch_summary()
-    if not summary:
+    S = fetch_summary()
+    if not S:
         return
 
-    # ---- state load/update header
     state = load_state()
     state["_last_run"] = now_str()
-    state["_last_balance"] = {"asset": QUOTE_ASSET, "free": round(free, 8), "locked": round(locked, 8), "total": round(total, 8)}
+    state["_last_balance"] = {"asset": QUOTE_ASSET, "free": round(free,8), "locked": round(locked,8), "total": round(total,8)}
 
-    # ---- 1) Promote or prune existing state first
-    # Promote filled pendings -> live and place TPs
-    to_delete = []
+    # 1) Maintain existing positions
     for sym, pos in list(state.items()):
-        if sym.startswith("_"):
+        if not isinstance(pos, dict) or sym.startswith("_"):
             continue
-        typ   = pos.get("type")
-        stat  = pos.get("status")
-        oid   = pos.get("entry_order_id")
-        ctime = pos.get("created_at")
+        try:
+            if pos.get("status") == "pending":
+                maybe_activate_pending(sym, pos)
+            elif pos.get("status") == "live":
+                manage_live(sym, pos)
+        except Exception as e:
+            log(f"[MAINTAIN ERROR] {sym}: {e}")
 
-        # Expire very old pendings
-        if stat == "pending" and PENDING_MAX_MINUTES > 0 and ctime:
-            try:
-                age_min = (now_utc().timestamp() - float(ctime)) / 60.0
-                if age_min > PENDING_MAX_MINUTES and oid:
-                    cancel_order(sym, oid)
-                    log(f"[PENDING TIMEOUT] {sym} > {PENDING_MAX_MINUTES}m -> cancelled & removed")
-                    to_delete.append(sym)
-                    continue
-            except Exception:
-                pass
+    # 2) Trade new candidates (stop-limit) and breakouts (market)
+    equity = equity_for_sizing()
 
-        # Check order status for pending
-        if stat == "pending" and oid:
-            od = poll_order(sym, oid)
-            if od and od.get("status") in ("FILLED", "PARTIALLY_FILLED"):
-                filled_qty = float(od.get("executedQty", "0"))
-                if filled_qty > 0:
-                    # place TPs now
-                    tick = float(pos.get("tick", "0"))
-                    if tick <= 0:
-                        # safety: fetch from filters if missing
-                        try:
-                            _, _, tick, _ = get_symbol_filters(sym)
-                        except Exception:
-                            tick = 0.0
-                    place_tp_limits(sym, filled_qty, float(pos["t1"]), float(pos["t2"]), tick if tick > 0 else 1e-8)
-                    pos["filled_qty"] = filled_qty
-                    pos["status"] = "live"
-                    pos["activated_at"] = now_utc().timestamp()
-                    log(f"[PROMOTE] {sym} pending -> live (qty={filled_qty})")
-
-        # Optional time-stop on live positions (close after LIVE_MAX_HOURS)
-        if ENABLE_TIME_STOP and stat == "live" and LIVE_MAX_HOURS > 0:
-            try:
-                act_ts = float(pos.get("activated_at", 0))
-                if act_ts > 0 and (now_utc().timestamp() - act_ts) > LIVE_MAX_HOURS * 3600:
-                    # place a market sell to free funds (best effort)
-                    qty = float(pos.get("filled_qty", 0.0))
-                    if qty > 0 and not DRY_RUN:
-                        try:
-                            client.create_order(symbol=sym, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
-                            log(f"[TIME-STOP] {sym} > {LIVE_MAX_HOURS}h -> market sell {qty}")
-                        except Exception as e:
-                            log(f"[TIME-STOP SELL ERROR] {sym}: {e}")
-                    to_delete.append(sym)
-            except Exception:
-                pass
-
-    for k in to_delete:
-        state.pop(k, None)
-
-    # ---- 2) New orders from summary
-    # Candidates -> stop-limit
-    if TRADE_CANDIDATES:
-        eq_c = equity_for_sizing() * max(0.0, C_RISK_MULT)
-        for c in summary.get("candidates", []):
-            sym = c["symbol"]
-            if not sym.endswith(QUOTE_ASSET):
+    # Candidates -> stop-limit buy at entry (reduced risk)
+    if TRADE_CANDS and equity > 0:
+        free_now, _, _ = get_spot_balance(QUOTE_ASSET)
+        for c in S.get("candidates", []):
+            sym = c.get("symbol")
+            if not sym or not sym.endswith(QUOTE_ASSET):
                 continue
-            entry = float(c["entry"]); stop = float(c["stop"]); t1=float(c["t1"]); t2=float(c["t2"])
+            entry = float(c["entry"]); stop = float(c["stop"])
+            t1 = float(c["t1"]); t2 = float(c["t2"])
 
-            # filters
             try:
                 min_qty, step_qty, tick, min_notional = get_symbol_filters(sym)
             except Exception as e:
-                log(f"[FILTER] {sym} {e}")
+                log(f"[FILTER] {sym} {e}"); continue
+
+            qty = compute_qty(entry, stop, equity * max(0.0, C_RISK_MULT),
+                              min_qty, step_qty, min_notional, ALLOW_MIN_ORDER)
+            qty = floor_to_step(qty, step_qty)
+            if qty < min_qty:
+                log(f"[CAND SKIP] {sym} qty too small")
                 continue
 
-            # pre-validate notional with LIMIT price (Binance evaluates notional at order price)
-            limit_price = round_to_tick(entry * (1 + STOP_LIMIT_OFFSET), tick)
-            qty, why = compute_qty(entry, stop, eq_c, min_qty, step_qty, min_notional,
-                                   price_for_notional=limit_price,
-                                   allow_min_order=ALLOW_MIN_ORDER)
-            if qty <= 0:
-                log(f"[CAND SKIP] {sym} qty={qty} reason={why}")
-                continue
-
-            # final safety: notional check
-            if qty * limit_price < min_notional:
-                log(f"[SKIP NOTIONAL] {sym} notional={qty*limit_price:.4f} < minNotional={min_notional}")
-                continue
-
-            # send order
-            o = place_stop_limit_buy(sym, qty, entry, tick)
+            o = place_stop_limit_buy(sym, qty, entry, tick, min_notional, free_now)
             if o:
                 state[sym] = {
                     "entry": entry, "stop": stop, "t1": t1, "t2": t2,
                     "filled_qty": 0.0, "t1_filled_qty": 0.0,
                     "status": "pending", "entry_order_id": o.get("orderId"),
                     "type": "C",
-                    "tick": tick,
-                    "min_qty": min_qty,
-                    "step_qty": step_qty,
-                    "min_notional": min_notional,
-                    "created_at": now_utc().timestamp()
+                    # cache filters for later TP/rounding
+                    "min_qty": min_qty, "step_qty": step_qty, "tick": tick, "min_notional": min_notional,
+                    "ts": now_utc().timestamp()
                 }
 
-    # Breakouts -> market buy + TPs
-    if summary.get("signals", {}).get("type") == "B":
-        eq_b = equity_for_sizing()
-        for o in summary.get("orders", []) or []:
-            sym = o["symbol"]
-            if not sym.endswith(QUOTE_ASSET):
+    # Breakouts -> market buy now + place TPs
+    if S.get("signals", {}).get("type") == "B" and equity > 0:
+        free_now, _, _ = get_spot_balance(QUOTE_ASSET)
+        for o in S.get("orders", []) or []:
+            sym = o.get("symbol")
+            if not sym or not sym.endswith(QUOTE_ASSET):
                 continue
-            entry = float(o["entry"]); stop = float(o["stop"]); t1=float(o["t1"]); t2=float(o["t2"])
+            entry = float(o["entry"]); stop = float(o["stop"])
+            t1 = float(o["t1"]); t2 = float(o["t2"])
 
-            # filters
             try:
                 min_qty, step_qty, tick, min_notional = get_symbol_filters(sym)
             except Exception as e:
-                log(f"[FILTER] {sym} {e}")
-                continue
+                log(f"[FILTER] {sym} {e}"); continue
 
-            # For market orders, estimate notional with latest price (or entry)
-            mprice = fetch_avg_price(sym) or entry
-            qty, why = compute_qty(entry, stop, eq_b, min_qty, step_qty, min_notional,
-                                   price_for_notional=mprice,
-                                   allow_min_order=ALLOW_MIN_ORDER)
-            if qty <= 0:
-                log(f"[BREAKOUT SKIP] {sym} qty={qty} reason={why}")
-                continue
-
-            if qty * mprice < min_notional:
-                log(f"[SKIP NOTIONAL] {sym} notional={qty*mprice:.4f} < minNotional={min_notional}")
+            qty = compute_qty(entry, stop, equity, min_qty, step_qty, min_notional, ALLOW_MIN_ORDER)
+            qty = floor_to_step(qty, step_qty)
+            notional = qty * entry
+            if qty < min_qty or notional < min_notional or notional > free_now:
+                log(f"[BREAKOUT SKIP] {sym} qty/notional invalid (qty={qty:.8f}, notional={notional:.4f}, free={free_now:.4f})")
                 continue
 
             m = place_market_buy(sym, qty)
             if m:
-                place_tp_limits(sym, qty, t1, t2, tick)
+                o1, o2 = place_tp_limits(sym, qty, t1, t2, tick, step_qty, min_qty, min_notional)
                 state[sym] = {
                     "entry": entry, "stop": stop, "t1": t1, "t2": t2,
                     "filled_qty": qty, "t1_filled_qty": 0.0,
                     "status": "live", "entry_order_id": m.get("orderId"),
                     "type": "B",
-                    "tick": tick,
-                    "min_qty": min_qty,
-                    "step_qty": step_qty,
-                    "min_notional": min_notional,
-                    "created_at": now_utc().timestamp(),
-                    "activated_at": now_utc().timestamp()
+                    "min_qty": min_qty, "step_qty": step_qty, "tick": tick, "min_notional": min_notional,
+                    "ts": now_utc().timestamp(),
+                    "tp1_order_id": (o1 or {}).get("orderId") if o1 else None,
+                    "tp2_order_id": (o2 or {}).get("orderId") if o2 else None,
                 }
 
     save_state(state)
