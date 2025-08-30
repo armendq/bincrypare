@@ -1,0 +1,69 @@
+{
+  "generated_at": "2025-08-30 09:48:08 CEST",
+  "timezone": "Europe/Prague",
+  "regime": {
+    "ok": true,
+    "reason": "Regime ignored by flag"
+  },
+  "signals": {
+    "type": "HOLD"
+  },
+  "orders": [],
+  "candidates": [],
+  "universe": {
+    "scanned": 224,
+    "eligible": 224,
+    "skipped": {
+      "no_data": [
+        "1000CHEEMS",
+        "1MBABYDOGE",
+        "A2Z",
+        "ANIME",
+        "CVC",
+        "DOGS",
+        "DOLO",
+        "GMX",
+        "KAIA",
+        "LISTA",
+        "MASK",
+        "MITO",
+        "NIL",
+        "OSMO",
+        "PUNDIX",
+        "RPL",
+        "SKL",
+        "SSV",
+        "STEEM",
+        "T",
+        "UMA",
+        "UTK",
+        "VANA"
+      ],
+      "missing_binance": []
+    }
+  },
+  "meta": {
+    "params": {
+      "ATR_LEN": 14,
+      "EMA_FAST": 20,
+      "EMA_SLOW": 200,
+      "SWING_LOOKBACK": 20,
+      "PROX_ATR_MIN": 0.0,
+      "PROX_ATR_MAX": 1.0,
+      "VOL_Z_MIN_PRE": 0.5,
+      "VOL_Z_MIN_BREAK": 0.7,
+      "BREAK_BUFFER_ATR": 0.02,
+      "MAX_CANDIDATES": 10,
+      "MIN_AVG_VOL": 1000.0,
+      "CAPITAL": 10000.0,
+      "RISK_PER_TRADE": 0.01,
+      "ANALYSES_EQUITY_USDC": 30.0,
+      "MIN_NOTIONAL_FALLBACK": 5.0,
+      "RELAXED_SIGNALS": true
+    },
+    "lower_tf_confirm": true,
+    "rs_reference": "BTCUSDC",
+    "binance_endpoint": "https://data-api.binance.vision",
+    "mode": "deep"
+  }
+}
