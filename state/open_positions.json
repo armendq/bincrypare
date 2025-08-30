@@ -1,5 +1,5 @@
 {
-  "_last_run": "2025-08-30 15:00:55",
+  "_last_run": "2025-08-30 15:25:30",
   "_last_balance": {
     "asset": "USDC",
     "free": 13.00201351,
@@ -64,5 +64,20 @@
     "entry_order_id": 75603497,
     "type": "C",
     "tps_placed": false
+  },
+  "1MBABYDOGEUSDC": {
+    "entry": 0.00120557,
+    "stop": 0.00116341,
+    "t1": 0.00121247,
+    "t2": 0.00121851,
+    "tick": 1e-07,
+    "min_qty": 1.0,
+    "step_qty": 1.0,
+    "filled_qty": 0.0,
+    "t1_filled_qty": 0.0,
+    "status": "pending",
+    "entry_order_id": 66281454,
+    "type": "C",
+    "created_at": 1756567533.202124
   }
 }
