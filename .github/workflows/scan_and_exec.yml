@@ -2,13 +2,13 @@ name: scan-and-exec
 
 on:
   schedule:
-    - cron: "*/7 * * * *"    # every 7 minutes (reduced overlap)
+    - cron: "*/7 * * * *"
   workflow_dispatch:
     inputs:
       ignore_regime:
         description: "Set 1 to bypass BTC regime"
         required: false
-        default: "1"         # default ON for manual runs
+        default: "1"
 
 permissions:
   contents: write
@@ -21,16 +21,17 @@ env:
   PYTHONUNBUFFERED: "1"
   BINANCE_BASE_URL: https://data-api.binance.vision
 
-  # ---- loosened thresholds to produce signals in quiet tape ----
-  IGNORE_REGIME: "1"        # <— force regime bypass for scheduled runs
-  RELAX_B_HIGH: "0"         # use 1h close to confirm (more permissive than high)
-  BREAK_BUFFER_ATR: "0.02"  # smaller buffer above HH20
-  VOL_Z_MIN_BREAK: "0.9"    # was 1.3/1.2
-  VOL_Z_MIN_PRE: "0.7"      # was 1.0
+  # Relaxed defaults for quiet markets (override via dispatch/env as needed)
+  RELAXED_SIGNALS: "1"
+  IGNORE_REGIME: "1"
+  RELAX_B_HIGH: "0"
+  BREAK_BUFFER_ATR: "0.02"
+  VOL_Z_MIN_BREAK: "0.7"
+  VOL_Z_MIN_PRE: "0.5"
   PROX_ATR_MIN: "0.00"
-  PROX_ATR_MAX: "0.70"      # wider pre-breakout window
-  MIN_AVG_VOL: "2500"       # accept lower liquidity for discovery (still filtered)
-  STOP_ATR_BUFFER: "0.4"    # used by analyses sizing logic
+  PROX_ATR_MAX: "1.0"
+  MIN_AVG_VOL: "1000"
+  STOP_ATR_BUFFER: "0.4"
   MIN_RISK_FLOOR_PCT: "0.008"
   MAX_RISK_CAP_PCT: "0.05"
   MAX_WORKERS: "12"
@@ -64,17 +65,14 @@ jobs:
       - name: Run analyses (deep, USDC)
         run: |
           set -euo pipefail
-          # allow manual override via dispatch input
           IGN_INPUT="${{ github.event.inputs.ignore_regime || '' }}"
           IGN="${IGNORE_REGIME}"
           if [ -n "${IGN_INPUT}" ]; then IGN="${IGN_INPUT}"; fi
           ARGS="--mode deep"
           if [ "${IGN}" = "1" ]; then ARGS="$ARGS --ignore_regime"; fi
-
           echo "Running analyses with ARGS: $ARGS"
           python -m scripts.analyses $ARGS
           test -s public_runs/latest/summary.json
-
           python - <<'PY'
           import json
           p=json.load(open('public_runs/latest/summary.json'))
@@ -85,11 +83,8 @@ jobs:
                 "| eligible:", uni.get("eligible"),
                 "| cands:", len(p.get("candidates",[])),
                 "| orders:", len(p.get("orders",[])))
-          if p.get("signals",{}).get("type")=="HOLD":
-              # dump top 5 candidates by score (if any) to see why they missed B
-              cs=sorted(p.get("candidates",[]), key=lambda x:x.get("score",0), reverse=True)[:5]
-              for i,c in enumerate(cs,1):
-                  print(f"[TOP{ i }] {c['symbol']} score={c.get('score')} vz={c.get('vol_z')} prox={c.get('prox_atr')} notes={c.get('notes')}")
+          if p.get("meta",{}).get("near_misses"):
+              print("Near-misses:", p["meta"]["near_misses"])
           PY
 
       # ---------- EXECUTE BEFORE ANY GIT OPS ----------
@@ -97,12 +92,12 @@ jobs:
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          DRY_RUN: "0"                 # live
-          FORCE_EQUITY_USD: "0"        # use live USDC balance
+          DRY_RUN: "0"
+          FORCE_EQUITY_USD: "0"
           QUOTE_ASSET: "USDC"
-          TRADE_CANDIDATES: "1"        # place stop-limit for C
-          C_RISK_MULT: "0.7"           # little more aggressive on C
-          STOP_LIMIT_OFFSET: "0.002"   # +0.2% above entry
+          TRADE_CANDIDATES: "1"
+          C_RISK_MULT: "0.7"
+          STOP_LIMIT_OFFSET: "0.002"
           SUMMARY_URL: "file://${{ github.workspace }}/public_runs/latest/summary.json"
         run: |
           set -euo pipefail
