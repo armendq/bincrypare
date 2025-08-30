@@ -36,6 +36,8 @@ env:
   MAX_RISK_CAP_PCT: "0.05"
   MAX_WORKERS: "12"
   LOG_LEVEL: "INFO"
+  ALLOW_MIN_ORDER: "1"   # enable fallback
+  MIN_ORDER_USD:  "6"    # at least $6 notional (>= exchange min)
 
 jobs:
   run:
